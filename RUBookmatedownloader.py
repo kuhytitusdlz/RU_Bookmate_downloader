@@ -9,8 +9,6 @@ import warnings
 import json
 import argparse
 import shutil
-import glob
-import subprocess
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup
