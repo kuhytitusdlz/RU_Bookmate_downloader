@@ -95,7 +95,7 @@ jobs:
           if (Test-Path LICENSE)   { Copy-Item LICENSE   $releaseDir -Force }
 
           # Also drop a version file
-          (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") | Out-File -Encoding utf8 (Join-Path $releaseDir "build_info.txt")
+          # (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") | Out-File -Encoding utf8 (Join-Path $releaseDir "build_info.txt")
 
       - name: Zip release
         shell: pwsh
