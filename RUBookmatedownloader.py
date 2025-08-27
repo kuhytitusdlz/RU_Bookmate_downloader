@@ -9,6 +9,8 @@ import warnings
 import json
 import argparse
 import shutil
+import glob
+import subprocess
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup
@@ -536,10 +538,140 @@ def download_book(uuid, series='', serial_path=None):
         URLS['book']['contentUrl'].format(uuid=uuid), f'{path}.epub'))
     # epub_to_fb2(f"{path}.epub", f"{path}.fb2")
 
-
     add_to_archive(uuid)
 
-def download_audiobook(uuid, series='', max_bitrate=False):
+
+def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, cleanup_chapters=True):
+    """
+    Merge all M4A chapter files in a directory into a single audiobook using ffmpeg.
+    Creates chapter markers and embeds cover image when available.
+    Returns True on success, False otherwise.
+    """
+    from pathlib import Path
+    import subprocess
+
+    audiobook_path = Path(audiobook_dir)
+    # Find all M4A files and sort them naturally by chapter number
+    chapter_files = sorted([f for f in audiobook_path.glob("*.m4a") if "Глава_" in f.name],
+                           key=lambda x: int(re.search(r'Глава_(\d+)\.m4a', x.name).group(1)) if re.search(r'Глава_(\d+)\.m4a', x.name) else 0)
+    if not chapter_files:
+        print(f"No chapter files found in {audiobook_path}")
+        return False
+
+    print(f"Found {len(chapter_files)} chapters, merging with ffmpeg...")
+
+    # Look for cover image
+    cover_image = None
+    for ext in ['.jpeg', '.jpg', '.png']:
+        potential_cover = audiobook_path / f"{audiobook_path.name}{ext}"
+        if potential_cover.exists():
+            cover_image = potential_cover
+            break
+
+    # Create a temporary file list and chapter metadata file for ffmpeg
+    filelist_path = audiobook_path / "chapters_list.txt"
+    chapters_metadata_path = audiobook_path / "chapters_metadata.txt"
+
+    try:
+        # Get chapter durations first (for proper chapter markers)
+        print(" Analyzing chapter durations...")
+        chapter_durations = []
+        current_time = 0.0
+        for chapter_file in chapter_files:
+            duration_cmd = [
+                'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+                '-of', 'csv=p=0', str(chapter_file)
+            ]
+            duration_result = subprocess.run(duration_cmd, capture_output=True, text=True)
+            if duration_result.returncode == 0 and duration_result.stdout.strip():
+                duration = float(duration_result.stdout.strip())
+            else:
+                print(f"⚠️ Could not get duration for {chapter_file.name}, assuming 180s")
+                duration = 180.0
+            chapter_durations.append((current_time, current_time + duration, chapter_file))
+            current_time += duration
+
+        # Write ffmpeg concat file list
+        with open(filelist_path, 'w', encoding='utf-8') as f:
+            for chapter_file in chapter_files:
+                abs_path = str(chapter_file.absolute()).replace("'", "'\"'\"'")
+                f.write(f"file '{abs_path}'\n")
+
+        # Create chapters metadata file
+        with open(chapters_metadata_path, 'w', encoding='utf-8') as f:
+            f.write(";FFMETADATA1\n")
+            # Add global metadata from dictionary if provided
+            if metadata:
+                for key, value in metadata.items():
+                    if value:
+                        escaped_value = str(value).replace('=', '\\=').replace(';', '\\;').replace('#', '\\#').replace('\\', '\\\\')
+                        f.write(f"{key.upper()}={escaped_value}\n")
+            # Add chapter markers
+            for i, (start_time, end_time, chapter_file) in enumerate(chapter_durations):
+                chapter_num = i + 1
+                f.write("\n[CHAPTER]\n")
+                f.write("TIMEBASE=1/1000\n")
+                f.write(f"START={int(start_time * 1000)}\n")
+                f.write(f"END={int(end_time * 1000)}\n")
+                f.write(f"title=Глава {chapter_num}\n")
+
+        # Build ffmpeg command
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(filelist_path),
+            '-i', str(chapters_metadata_path),
+        ]
+        if cover_image:
+            cmd.extend(['-i', str(cover_image)])
+            cmd.extend(['-c:v', 'copy'])
+            cmd.extend(['-c:a', 'copy'])
+            cmd.extend(['-disposition:v:0', 'attached_pic'])
+            cmd.extend(['-map_metadata', '1'])
+        else:
+            cmd.extend(['-c', 'copy'])
+            cmd.extend(['-map_metadata', '1'])
+
+        if metadata:
+            for key, value in metadata.items():
+                if value:
+                    cmd.extend(['-metadata', f'{key}={value}'])
+        else:
+            cmd.extend(['-metadata', f'title={audiobook_path.name}'])
+            cmd.extend(['-metadata', 'genre=Audiobook'])
+            cmd.extend(['-metadata', 'media_type=2'])
+
+        cmd.append(str(output_file))
+
+        # Run ffmpeg
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if result.returncode == 0:
+            print(f"✅ Successfully merged audiobook: {output_file}")
+            # Clean up individual chapter files after successful merge (if requested)
+            if cleanup_chapters:
+                print(" Cleaning up chapter files...")
+                for chapter_file in chapter_files:
+                    try:
+                        Path(chapter_file).unlink()
+                        print(f" Removed: {chapter_file.name}")
+                    except OSError as e:
+                        print(f" ⚠️ Could not remove {chapter_file.name}: {e}")
+            return True
+        else:
+            print(f"❌ Error merging audiobook with ffmpeg:")
+            print(result.stderr)
+            return False
+    finally:
+        # Remove temp files
+        try:
+            if filelist_path.exists():
+                filelist_path.unlink()
+            if chapters_metadata_path.exists():
+                chapters_metadata_path.unlink()
+        except Exception:
+            pass
+def download_audiobook(uuid, series='', max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
     if is_archived(uuid):
         print(f"[archive] Skipping already downloaded: {uuid}")
         return
@@ -573,7 +705,8 @@ def download_audiobook(uuid, series='', max_bitrate=False):
                     print(f"Throttling for {pause:.2f}s before next track...")
                     time.sleep(pause)
                 asyncio.run(download_file(download_url, f"{book_dir}/{name}"))
-
+    else:
+        print(f" Audiobook chapters saved separately in: {os.path.dirname(path)}")
 
     add_to_archive(uuid)
 
@@ -594,7 +727,6 @@ def download_comicbook(uuid, series=''):
         shutil.rmtree(download_dir + "/preview", ignore_errors=False, onerror=None)
         create_pdf_from_images(download_dir, f"{name}.pdf")
 
-
     add_to_archive(uuid)
 
 def download_serial(uuid):
@@ -609,7 +741,6 @@ def download_serial(uuid):
             download_dir = f'{os.path.dirname(path)}/{name}'
             os.makedirs(download_dir, exist_ok=True)
             download_book(episode['uuid'], serial_path=f'{download_dir}/{name}')
-
 
     add_to_archive(uuid)
 
@@ -626,7 +757,6 @@ def download_series(uuid):
         func = FUNCTION_MAP[part['resource_type']]
         func(part['resource']['uuid'], f"{name}/{part_index+1}. ")
 
-
     add_to_archive(uuid)
 
 def main():
@@ -634,7 +764,7 @@ def main():
     argparser.add_argument("command", choices=FUNCTION_MAP.keys())
     argparser.add_argument("uuid")
     # ИСТОРИЧЕСКИЙ ФЛАГ: при наличии флага используем max_bitrate=False -> берём 'min_bit_rate'
-    argparser.add_argument("--max_bitrate", action='store_false', help="Use min_bit_rate if flag is present (legacy behavior).")
+    argparser.add_argument("--max-bitrate", action='store_false', help="Use min_bit_rate if flag is present (legacy behavior).")
     # Новые параметры управления сетевым поведением
     argparser.add_argument("--proxy", type=str, default=None, help="Proxy URL, e.g. socks5h://127.0.0.1:9050 or http://127.0.0.1:8080")
     argparser.add_argument("--throttle", type=float, default=None, help="Polite delay (seconds) between track downloads (e.g. 1.5)")
@@ -644,6 +774,8 @@ def main():
     argparser.add_argument("--timeout-base-dl", type=float, default=None, help="Base timeout for file downloads (default 15)")
     argparser.add_argument("--force-meta", action="store_true", help="Overwrite meta files (jpeg/json/info.txt) even if they exist")
     argparser.add_argument("--archive", type=str, default="archive.txt", help="Path to archive file with downloaded IDs")
+    argparser.add_argument("--no-merge", action='store_true', help="Keep audiobook chapters as separate files (don't merge)")
+    argparser.add_argument("--keep-chapters", action='store_true', help="Keep individual chapter files after merging")
     args = argparser.parse_args()
 
     # Archive initialization
@@ -680,7 +812,7 @@ def main():
     # Вызов команды
     func = FUNCTION_MAP[args.command]
     if args.command == 'audiobook':
-        func(args.uuid, max_bitrate=args.max_bitrate)
+        func(args.uuid, max_bitrate=args.max_bitrate, merge_chapters=not args.no_merge, cleanup_chapters=not args.keep_chapters)
     else:
         func(args.uuid)
 
