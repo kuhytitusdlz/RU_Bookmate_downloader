@@ -83,6 +83,43 @@ URLS = {
     }
 }
 
+
+
+# =========================
+# Archive support (yt-dlp-style)
+# =========================
+ARCHIVE_FILE = "archive.txt"
+_archive_cache: set[str] | None = None
+
+def init_archive(path: str | None = None):
+    """Initialize archive cache and optionally set custom archive file path."""
+    global ARCHIVE_FILE, _archive_cache
+    if path:
+        ARCHIVE_FILE = path
+    if _archive_cache is None:
+        try:
+            with open(ARCHIVE_FILE, 'r', encoding='utf-8') as f:
+                _archive_cache = set(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            _archive_cache = set()
+    return _archive_cache
+
+def is_archived(uid: str) -> bool:
+    """Return True if the given resource id is present in archive."""
+    return uid.strip() in init_archive()
+
+def add_to_archive(uid: str):
+    """Append the given id to the archive file (idempotent)."""
+    uid = uid.strip()
+    if not uid:
+        return
+    arc = init_archive()
+    if uid not in arc:
+        os.makedirs(os.path.dirname(ARCHIVE_FILE) or ".", exist_ok=True)
+        with open(ARCHIVE_FILE, 'a', encoding='utf-8') as f:
+            f.write(uid + "\n")
+        arc.add(uid)
+        print(f"[archive] Added {uid} to {ARCHIVE_FILE}")
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -491,13 +528,21 @@ def get_resource_json(resource_type, uuid):
 
 
 def download_book(uuid, series='', serial_path=None):
+    if is_archived(uuid):
+        print(f"[archive] Skipping already downloaded: {uuid}")
+        return
     path = serial_path if serial_path else get_resource_info('book', uuid, series)
     asyncio.run(download_file(
         URLS['book']['contentUrl'].format(uuid=uuid), f'{path}.epub'))
     # epub_to_fb2(f"{path}.epub", f"{path}.fb2")
 
 
+    add_to_archive(uuid)
+
 def download_audiobook(uuid, series='', max_bitrate=False):
+    if is_archived(uuid):
+        print(f"[archive] Skipping already downloaded: {uuid}")
+        return
     path = get_resource_info('audiobook', uuid, series)
     resp = get_resource_json('audiobook', uuid)
     if resp:
@@ -530,7 +575,12 @@ def download_audiobook(uuid, series='', max_bitrate=False):
                 asyncio.run(download_file(download_url, f"{book_dir}/{name}"))
 
 
+    add_to_archive(uuid)
+
 def download_comicbook(uuid, series=''):
+    if is_archived(uuid):
+        print(f"[archive] Skipping already downloaded: {uuid}")
+        return
     path = get_resource_info('comicbook', uuid, series)
     resp = get_resource_json('comicbook', uuid)
     if resp:
@@ -545,7 +595,12 @@ def download_comicbook(uuid, series=''):
         create_pdf_from_images(download_dir, f"{name}.pdf")
 
 
+    add_to_archive(uuid)
+
 def download_serial(uuid):
+    if is_archived(uuid):
+        print(f"[archive] Skipping already downloaded: {uuid}")
+        return
     path = get_resource_info('book', uuid)
     resp = get_resource_json('serial', uuid)
     if resp:
@@ -556,7 +611,12 @@ def download_serial(uuid):
             download_book(episode['uuid'], serial_path=f'{download_dir}/{name}')
 
 
+    add_to_archive(uuid)
+
 def download_series(uuid):
+    if is_archived(uuid):
+        print(f"[archive] Skipping already downloaded: {uuid}")
+        return
     path = get_resource_info('series', uuid)
     resp = get_resource_json('series', uuid)
     name = os.path.basename(path)
@@ -566,6 +626,8 @@ def download_series(uuid):
         func = FUNCTION_MAP[part['resource_type']]
         func(part['resource']['uuid'], f"{name}/{part_index+1}. ")
 
+
+    add_to_archive(uuid)
 
 def main():
     argparser = argparse.ArgumentParser()
@@ -581,7 +643,16 @@ def main():
     argparser.add_argument("--timeout-base-req", type=float, default=None, help="Base timeout for metadata requests (default 10)")
     argparser.add_argument("--timeout-base-dl", type=float, default=None, help="Base timeout for file downloads (default 15)")
     argparser.add_argument("--force-meta", action="store_true", help="Overwrite meta files (jpeg/json/info.txt) even if they exist")
+    argparser.add_argument("--archive", type=str, default="archive.txt", help="Path to archive file with downloaded IDs")
     args = argparser.parse_args()
+
+    # Archive initialization
+    init_archive(args.archive)
+
+    # Early archive check to avoid unnecessary auth/network if already downloaded
+    if is_archived(args.uuid):
+        print(f"[archive] Skipping already downloaded: {args.uuid}")
+        return
 
     # Токен авторизации
     HEADERS['auth-token'] = get_auth_token()
