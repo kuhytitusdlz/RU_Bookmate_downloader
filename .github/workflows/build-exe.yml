@@ -15,64 +15,95 @@ permissions:
 jobs:
   build-windows-exe:
     runs-on: windows-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
+      - name: Install build deps
         run: |
           python -m pip install --upgrade pip
-          if (Test-Path requirements.txt) {
-            pip install -r requirements.txt
-          } else {
-            echo "requirements.txt not found, installing known deps"
-            pip install httpx beautifulsoup4 ebooklib reportlab pillow pywebview lxml
-          }
+          pip install -r requirements.txt
           pip install pyinstaller
 
       - name: Build EXE with PyInstaller
+        shell: pwsh
         run: |
-          pyinstaller RUBookmatedownloader.py `
-            --name RUBookmateDownloader `
+          # Clean previous builds if any
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist)  { Remove-Item -Recurse -Force dist }
+
+          # Build one-file EXE
+          pyinstaller `
+            --noconfirm `
             --onefile `
-            --collect-all ebooklib `
-            --collect-all bs4 `
-            --collect-all reportlab `
-            --collect-all PIL
+            --name RUBookmateDownloader `
+            --add-data "requirements.txt;." `
+            --hidden-import httpx `
+            --hidden-import PIL `
+            --hidden-import ebooklib `
+            --hidden-import bs4 `
+            --hidden-import lxml `
+            RUBookmatedownloader.py
 
-      - name: Install ffmpeg (Chocolatey)
+          # Determine output dist subfolder dynamically (PyInstaller creates dist/<name> or dist with single EXE)
+          $distDir = (Get-ChildItem dist -Directory | Select-Object -First 1).FullName
+          if (-not $distDir) { $distDir = "dist" }
+          echo "DISTDIR=$distDir" >> $env:GITHUB_ENV
+
+      - name: Download FFmpeg (BtbN prebuilt)
+        shell: pwsh
         run: |
-          choco install ffmpeg -y --no-progress
-          $ffmpegPath = (Get-Command ffmpeg).Source
-          echo "FFmpeg at: $ffmpegPath"
-          Copy-Item $ffmpegPath dist\RUBookmateDownloader\ffmpeg.exe
+          $ffUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip"
+          $tmp    = "$env:RUNNER_TEMP"
+          $zip    = Join-Path $tmp "ffmpeg.zip"
+          $outDir = Join-Path $tmp "ffmpeg"
+          Invoke-WebRequest -Uri $ffUrl -OutFile $zip -UseBasicParsing
+          if (Test-Path $outDir) { Remove-Item -Recurse -Force $outDir }
+          Expand-Archive -Path $zip -DestinationPath $outDir -Force
 
-      - name: Copy docs
+          # Find /bin with ffmpeg.exe
+          $binDir = Get-ChildItem $outDir -Recurse -Directory | Where-Object { Test-Path (Join-Path $_.FullName "ffmpeg.exe") } | Select-Object -First 1
+          if (-not $binDir) { Write-Error "ffmpeg.exe not found after extraction"; exit 1 }
+
+          $distDir = $env:DISTDIR
+          if (-not (Test-Path $distDir)) { New-Item -ItemType Directory -Force -Path $distDir | Out-Null }
+
+          Copy-Item (Join-Path $binDir.FullName "*") -Destination $distDir -Recurse -Force
+          Get-ChildItem $distDir -Filter "ff*.exe" | ForEach-Object { Write-Host "Bundled $($_.Name)" }
+
+      - name: Prepare release folder
+        shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release\RUBookmateDownloader-win64 | Out-Null
-          Copy-Item dist\RUBookmateDownloader\RUBookmateDownloader.exe release\RUBookmateDownloader-win64\
-          if (Test-Path dist\RUBookmateDownloader\ffmpeg.exe) { Copy-Item dist\RUBookmateDownloader\ffmpeg.exe release\RUBookmateDownloader-win64\ }
-          if (Test-Path README.md) { Copy-Item README.md release\RUBookmateDownloader-win64\ }
-          if (Test-Path LICENSE) { Copy-Item LICENSE release\RUBookmateDownloader-win64\ }
+          $distDir = $env:DISTDIR
+          $releaseDir = "release\RUBookmateDownloader-win64"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-      - name: Create zip
+          # Copy main EXE and bundled tools
+          Copy-Item (Join-Path $distDir "RUBookmateDownloader.exe") $releaseDir -Force
+          if (Test-Path (Join-Path $distDir "ffmpeg.exe"))  { Copy-Item (Join-Path $distDir "ffmpeg.exe")  $releaseDir -Force }
+          if (Test-Path (Join-Path $distDir "ffprobe.exe")) { Copy-Item (Join-Path $distDir "ffprobe.exe") $releaseDir -Force }
+          if (Test-Path (Join-Path $distDir "ffplay.exe"))  { Copy-Item (Join-Path $distDir "ffplay.exe")  $releaseDir -Force }
+
+          # Optional: include README and license if present
+          if (Test-Path README.md) { Copy-Item README.md $releaseDir -Force }
+          if (Test-Path LICENSE)   { Copy-Item LICENSE   $releaseDir -Force }
+
+          # Also drop a version file
+          (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") | Out-File -Encoding utf8 (Join-Path $releaseDir "build_info.txt")
+
+      - name: Zip release
+        shell: pwsh
         run: |
           $zipPath = "release\RUBookmateDownloader-win64.zip"
-          if (Test-Path $zipPath) { Remove-Item $zipPath }
-          Compress-Archive -Path release\RUBookmateDownloader-win64\* -DestinationPath $zipPath
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "release\RUBookmateDownloader-win64\*" -DestinationPath $zipPath -Force
+          echo "ZIP=$zipPath" >> $env:GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
