@@ -1,3 +1,4 @@
 mybooks/
 token.txt
+venv/
 get_all_uuid.py

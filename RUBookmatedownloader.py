@@ -17,6 +17,21 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from PIL import Image
 
+# =========================
+# Конфигурация по умолчанию
+# =========================
+
+CONFIG = {
+    "max_retries": 5,            # всего попыток (включая первую)
+    "backoff_initial": 5.0,      # стартовая задержка между ретраями (сек)
+    "backoff_cap": 120.0,        # максимум задержки между ретраями (сек)
+    "timeout_base_download": 15.0,  # базовый таймаут для download_file (сек, умножается экспоненциально)
+    "timeout_base_request": 10.0,   # базовый таймаут для send_request (сек, умножается экспоненциально)
+    "throttle": 0.0,             # «вежливая» задержка между скачиванием треков (сек). 0 = выкл
+    "force_meta": False,         # перезаписывать jpeg/json/info.txt, даже если существуют
+    "proxy_url": None,           # строка прокси: socks5h://127.0.0.1:9050 или http://127.0.0.1:8080
+}
+
 UA = {
     1: "Samsung/Galaxy_A51 Android/12 Bookmate/3.7.3",
     2: "Huawei/P40_Lite Android/11 Bookmate/3.7.3",
@@ -68,15 +83,18 @@ URLS = {
     }
 }
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
 
 def get_auth_token():
-    if os.path.isfile("token.txt"):
-        with open("token.txt", encoding='utf-8') as file:
+    token_file = "token.txt"
+    if os.path.isfile(token_file):
+        with open(token_file, encoding='utf-8') as file:
             return file.read()
     if HEADERS['auth-token']:
         return HEADERS['auth-token']
     auth_token = run_auth_webview()
-    with open("token.txt", "w", encoding='utf-8') as file:
+    with open(token_file, "w", encoding='utf-8') as file:
         file.write(auth_token)
     return auth_token
 
@@ -88,12 +106,13 @@ def run_auth_webview():
     def on_loaded(window):
         if "yx4483e97bab6e486a9822973109a14d05.oauth.yandex.ru" in urllib.parse.urlparse(window.get_current_url()).netloc:
             url = urllib.parse.urlparse(window.get_current_url())
-            window.auth_token = urllib.parse.parse_qs(url.fragment)[
-                'access_token'][0]
+            window.auth_token = urllib.parse.parse_qs(url.fragment)['access_token'][0]
             window.destroy()
 
     window = webview.create_window(
-        'Вход в аккаунт', 'https://oauth.yandex.ru/authorize?response_type=token&client_id=4483e97bab6e486a9822973109a14d05')
+        'Вход в аккаунт',
+        'https://oauth.yandex.ru/authorize?response_type=token&client_id=4483e97bab6e486a9822973109a14d05'
+    )
     window.events.loaded += on_loaded
     window.auth_token = None
     webview.start()
@@ -106,53 +125,198 @@ def replace_forbidden_chars(filename):
     return re.sub(f'[{chars}]', '', filename)
 
 
-async def download_file(url, file_path):
-    is_download = False
-    count = 0
-    while not is_download:
-        async with httpx.AsyncClient(http2=True, verify=False) as client:
-            response = await client.get(url, headers=HEADERS, timeout=None)
-            if response.status_code == 200:
-                is_download = True
-                with open(file_path, 'wb') as file:
-                    file.write(response.content)
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    # число секунд
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    # HTTP-дата
+    try:
+        from email.utils import parsedate_to_datetime
+        import datetime as dt
+        dt_utc = parsedate_to_datetime(value)
+        if dt_utc is None:
+            return None
+        now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+        return max(0.0, (dt_utc - now).total_seconds())
+    except Exception:
+        return None
+
+
+def _build_transport(http2: bool = True, verify: bool = False):
+    """
+    Для httpx>=0.27: прокси задаём на уровне транспорта.
+    Поддерживает SOCKS5h при установленном extras 'socks'.
+    """
+    params = dict(http2=http2, verify=verify)
+    if CONFIG["proxy_url"]:
+        params["proxy"] = CONFIG["proxy_url"]
+    return httpx.AsyncHTTPTransport(**params)
+
+
+async def download_file(
+    url: str,
+    file_path: str,
+    max_retries: int | None = None,
+    base_timeout: float | None = None,
+    backoff_initial: float | None = None,
+    backoff_cap: float | None = None,
+):
+    """
+    Потоковое скачивание с ретраями, экспоненциальными таймаутами и .part-файлом.
+    """
+    if max_retries is None:
+        max_retries = CONFIG["max_retries"]
+    if base_timeout is None:
+        base_timeout = CONFIG["timeout_base_download"]
+    if backoff_initial is None:
+        backoff_initial = CONFIG["backoff_initial"]
+    if backoff_cap is None:
+        backoff_cap = CONFIG["backoff_cap"]
+
+    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+
+    for attempt in range(max_retries):
+        factor = 2 ** attempt
+        timeout = httpx.Timeout(
+            connect=base_timeout * factor,
+            read=base_timeout * factor,
+            write=base_timeout * factor,
+            pool=base_timeout * factor,
+        )
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=timeout,
+                transport=_build_transport(http2=True, verify=False),
+            ) as client:
+                tmp_path = f"{file_path}.part"
+                async with client.stream("GET", url, headers=HEADERS) as resp:
+                    if resp.status_code != 200:
+                        raise httpx.HTTPStatusError(
+                            f"Bad status {resp.status_code}",
+                            request=resp.request,
+                            response=resp,
+                        )
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            if chunk:
+                                f.write(chunk)
+                os.replace(tmp_path, file_path)
                 print(f"File downloaded successfully to {file_path}")
-            elif response.is_redirect:
-                response = await client.get(response.next_request.url)
-                if response.status_code == 200:
-                    is_download = True
-                    with open(file_path, 'wb') as file:
-                        file.write(response.content)
-                    print(f"File downloaded successfully to {file_path}")
-            else:
+                return
+
+        except (httpx.ReadError,
+                httpx.TimeoutException,
+                httpx.RemoteProtocolError,
+                httpx.ConnectError,
+                httpx.HTTPStatusError) as e:
+            # подчистим .part
+            tmp_path = f"{file_path}.part"
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+            # вычислим задержку перед повтором
+            retry_after = None
+            status = None
+            if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                status = e.response.status_code
+                if status in RETRY_STATUSES:
+                    retry_after = _parse_retry_after(e.response.headers.get("Retry-After"))
+
+            if attempt < max_retries - 1 and (status in (None, RETRY_STATUSES)):
+                base_wait = backoff_initial * factor
+                wait_s = max(base_wait, retry_after or 0.0)
+                wait_s = min(wait_s, backoff_cap) + random.uniform(0, 0.8)
+                human = f"HTTP {status}" if status else f"{type(e).__name__}"
                 print(
-                    f"Failed to download file. Status code: {response.status_code}")
-                count += 1
-                if count == 3:
-                    print(
-                        "Failed to download the file check if the id is correct or try again later")
-                    sys.exit()
-                time.sleep(5)
+                    f"Download attempt {attempt+1}/{max_retries} failed ({human}). "
+                    f"Retrying in {wait_s:.1f}s..."
+                )
+                await asyncio.sleep(wait_s)
+            else:
+                print("Failed to download the file after several attempts.")
+                sys.exit(1)
 
 
-async def send_request(url):
-    is_download = False
-    count = 0
-    while not is_download:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=HEADERS, timeout=None)
-            if response.status_code == 200:
-                is_download = True
-                return response
-            else:
+async def send_request(
+    url: str,
+    max_retries: int | None = None,
+    base_timeout: float | None = None,
+    backoff_initial: float | None = None,
+    backoff_cap: float | None = None,
+):
+    """
+    GET с ретраями. Возвращает успешный Response (200) или падает на неретраибл кодах.
+    """
+    if max_retries is None:
+        max_retries = CONFIG["max_retries"]
+    if base_timeout is None:
+        base_timeout = CONFIG["timeout_base_request"]
+    if backoff_initial is None:
+        backoff_initial = CONFIG["backoff_initial"]
+    if backoff_cap is None:
+        backoff_cap = CONFIG["backoff_cap"]
+
+    for attempt in range(max_retries):
+        factor = 2 ** attempt
+        timeout = httpx.Timeout(
+            connect=base_timeout * factor,
+            read=base_timeout * factor,
+            write=base_timeout * factor,
+            pool=base_timeout * factor,
+        )
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=timeout,
+                transport=_build_transport(http2=False, verify=False),
+            ) as client:
+                resp = await client.get(url, headers=HEADERS)
+                if resp.status_code == 200:
+                    return resp
+                # ретраи только на RETRY_STATUSES
+                if resp.status_code in RETRY_STATUSES:
+                    raise httpx.HTTPStatusError(
+                        f"Bad status {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                resp.raise_for_status()
+
+        except (httpx.ReadError,
+                httpx.TimeoutException,
+                httpx.RemoteProtocolError,
+                httpx.ConnectError,
+                httpx.HTTPStatusError) as e:
+            status = None
+            retry_after = None
+            if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                status = e.response.status_code
+                if status not in RETRY_STATUSES:
+                    # неретраибл код — падаем сразу
+                    raise
+                retry_after = _parse_retry_after(e.response.headers.get("Retry-After"))
+
+            if attempt < max_retries - 1:
+                base_wait = backoff_initial * factor
+                wait_s = max(base_wait, retry_after or 0.0)
+                wait_s = min(wait_s, backoff_cap) + random.uniform(0, 0.8)
+                human = f"HTTPStatusError: Bad status {status}" if status else f"{type(e).__name__}"
                 print(
-                    f"Failed to send request. Status code: {response.status_code}")
-                count += 1
-                if count == 3:
-                    print(
-                        "Failed to download the file check if the id is correct or try again later")
-                    sys.exit()
-                time.sleep(5)
+                    f"Request attempt {attempt+1}/{max_retries} failed ({human}). "
+                    f"Retrying in {wait_s:.1f}s..."
+                )
+                await asyncio.sleep(wait_s)
+            else:
+                print("Failed to download the file after several attempts. Check the ID or try again later.")
+                sys.exit(1)
 
 
 def create_pdf_from_images(images_folder, output_pdf):
@@ -192,20 +356,132 @@ def epub_to_fb2(epub_path, fb2_path):
     print(f"fb2 file save to {fb2_path}")
 
 
+def write_book_info(text, path, overwrite: bool = False):
+    """
+    Пишет аннотацию в {path}.txt, создает каталог при необходимости.
+    При overwrite=False пропускает, если файл уже есть.
+    """
+    info_path = f"{path}.txt"
+    os.makedirs(os.path.dirname(info_path) or ".", exist_ok=True)
+    if not overwrite and os.path.exists(info_path):
+        print(f"Annotation already exists, skip: {info_path}")
+        return info_path
+    with open(info_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    print(f"Annotation saved successfully to {info_path}")
+    return info_path
+
+
 def get_resource_info(resource_type, uuid, series=''):
+    """
+    Скачивает метаинформацию и обложку; idempotent — пропускает, если уже скачано,
+    кроме случая force_meta.
+    """
     info_url = URLS[resource_type]['infoUrl'].format(uuid=uuid)
     info = asyncio.run(send_request(info_url)).json()
-    if info:
-        picture_url = info[resource_type]["cover"]["large"]
-        name = info[resource_type]["title"]
-        name = replace_forbidden_chars(name)
-        download_dir = f"mybooks/{'series' if series else resource_type}/{series}{name}/"
-        path = f'{download_dir}{name}'
-        os.makedirs(os.path.dirname(download_dir), exist_ok=True)
-        asyncio.run(download_file(picture_url, f'{path}.jpeg'))
-        with open(f"{path}.json", 'w', encoding='utf-8') as file:
+    if not info:
+        return None
+
+    picture_url = info[resource_type]["cover"]["large"]
+    name = info[resource_type]["title"]
+    name = replace_forbidden_chars(name)
+    namelist = name.split(". ", 2)[:2]
+    name = "_".join(namelist)
+
+    download_dir = f"mybooks/{'series' if series else resource_type}/{series}{name}/"
+    path = f'{download_dir}{name}'
+    os.makedirs(download_dir, exist_ok=True)
+
+    # --- JPEG (обложка) ---
+    jpeg_path = f'{path}.jpeg'
+    if os.path.isfile(jpeg_path) and not CONFIG["force_meta"]:
+        print(f"Cover already exists, skip: {jpeg_path}")
+    else:
+        asyncio.run(download_file(picture_url, jpeg_path))
+
+    # --- JSON с meta ---
+    json_path = f"{path}.json"
+    if os.path.isfile(json_path) and not CONFIG["force_meta"]:
+        print(f"JSON already exists, skip: {json_path}")
+    else:
+        with open(json_path, 'w', encoding='utf-8') as file:
             file.write(json.dumps(info, ensure_ascii=False))
-        print(f"File downloaded successfully to {path}.json")
+        print(f"File downloaded successfully to {json_path}")
+
+    # --- Аннотация info.txt ---
+    book_info = info[resource_type]['annotation']
+    book_info += "\n\n"
+
+    if info[resource_type]['age_restriction']:
+        if int(info[resource_type]['age_restriction']) > 0:
+            book_info += "\nВозрастные ограничения: "
+            book_info += info[resource_type]['age_restriction'] + "+"
+
+    if info[resource_type]['owner_catalog_title']:
+        book_info += "\nПравообладатель: "
+        book_info += info[resource_type]['owner_catalog_title']
+
+    if info[resource_type]['publishers']:
+        i = 0
+        for publisher in info[resource_type]['publishers']:
+            if i > 0:
+                book_info += ", "
+            else:
+                book_info += "\nИздательство: "
+            book_info += publisher['name']
+            i += 1
+
+    if info[resource_type]['publication_date']:
+        book_info += "\nГод выхода издания: "
+        import datetime as dt
+        epoch_time = int(info[resource_type]['publication_date'])
+        book_info += dt.datetime.fromtimestamp(epoch_time).strftime('%Y')
+
+    if info[resource_type]['duration']:
+        book_info += "\nДлительность: "
+        epoch_time = int(info[resource_type]['duration'])
+        seconds = epoch_time % 60
+        minutes = int(epoch_time / 60) % 60
+        hours = int(epoch_time / 3600)
+        if hours > 0:
+            book_info += str(hours) + " ч. "
+        book_info += str(minutes) + " мин. "
+        book_info += str(seconds) + " сек. "
+
+    if info[resource_type]['translators']:
+        i = 0
+        for translator in info[resource_type]['translators']:
+            if i > 0:
+                book_info += ", "
+            else:
+                book_info += "\nПеревод: "
+            book_info += translator['name']
+            i += 1
+
+    if info[resource_type]['narrators']:
+        i = 0
+        for narrator in info[resource_type]['narrators']:
+            if i > 0:
+                book_info += ", "
+            else:
+                book_info += "\nОзвучили: "
+            book_info += narrator['name']
+            i += 1
+
+    if info[resource_type]['topics']:
+        i = 0
+        for topic in info[resource_type]['topics']:
+            if topic['title'] != "Аудио":
+                if i > 0:
+                    book_info += ", "
+                else:
+                    book_info += "\n\nТеги: "
+                book_info += topic['title']
+            i += 1
+
+    # write_book_info сама пропустит запись, если info.txt уже есть (если не force_meta)
+    write_book_info(book_info, os.path.join(download_dir, "info"), overwrite=CONFIG["force_meta"])
+
     return path
 
 
@@ -215,11 +491,10 @@ def get_resource_json(resource_type, uuid):
 
 
 def download_book(uuid, series='', serial_path=None):
-    path = serial_path if serial_path else get_resource_info(
-        'book', uuid, series)
+    path = serial_path if serial_path else get_resource_info('book', uuid, series)
     asyncio.run(download_file(
         URLS['book']['contentUrl'].format(uuid=uuid), f'{path}.epub'))
-    epub_to_fb2(f"{path}.epub", f"{path}.fb2")
+    # epub_to_fb2(f"{path}.epub", f"{path}.fb2")
 
 
 def download_audiobook(uuid, series='', max_bitrate=False):
@@ -228,13 +503,31 @@ def download_audiobook(uuid, series='', max_bitrate=False):
     if resp:
         bitrate = 'max_bit_rate' if max_bitrate else 'min_bit_rate'
         json_data = resp['tracks']
-        files = os.listdir(os.path.dirname(path))
+        book_dir = os.path.dirname(path)
+        files = os.listdir(book_dir)
+        ntracks = len(json_data)
+        if ntracks < 10:
+            width = 1
+        elif 10 <= ntracks < 100:
+            width = 2
+        else:
+            width = 3
+
         for track in json_data:
-            name = f'Глава_{track["number"]+1}.m4a'
+            ntrack = f'{track["number"]}'
+            i = len(ntrack)
+            while i < width:
+                ntrack = '0' + ntrack
+                i = i + 1
+            name = 'Глава_' + ntrack + '.m4a'
             if name not in files:
                 download_url = track['offline'][bitrate]['url'].replace(".m3u8", ".m4a")
-                asyncio.run(download_file(
-                    download_url, f'{os.path.dirname(path)}/{name}'))
+                # «вежливая» задержка, если включена
+                if CONFIG["throttle"] and CONFIG["throttle"] > 0:
+                    pause = random.uniform(CONFIG["throttle"] / 2, CONFIG["throttle"])
+                    print(f"Throttling for {pause:.2f}s before next track...")
+                    time.sleep(pause)
+                asyncio.run(download_file(download_url, f"{book_dir}/{name}"))
 
 
 def download_comicbook(uuid, series=''):
@@ -242,12 +535,14 @@ def download_comicbook(uuid, series=''):
     resp = get_resource_json('comicbook', uuid)
     if resp:
         download_url = resp["uris"]["zip"]
-        asyncio.run(download_file(download_url, f'{path}.cbr'))
-        with zipfile.ZipFile(f'{path}.cbr', 'r') as zip_ref:
-            zip_ref.extractall(os.path.dirname(path))
-        shutil.rmtree(os.path.dirname(path)+"/preview",
-                      ignore_errors=False, onerror=None)
-        create_pdf_from_images(os.path.dirname(path), f"{path}.pdf")
+        namelist = path.split(". ", 2)[:2]
+        name = "_".join(namelist)
+        download_dir = os.path.dirname(path)
+        asyncio.run(download_file(download_url, f'{name}.cbr'))
+        with zipfile.ZipFile(f'{name}.cbr', 'r') as zip_ref:
+            zip_ref.extractall(download_dir)
+        shutil.rmtree(download_dir + "/preview", ignore_errors=False, onerror=None)
+        create_pdf_from_images(download_dir, f"{name}.pdf")
 
 
 def download_serial(uuid):
@@ -258,8 +553,7 @@ def download_serial(uuid):
             name = f"{episode_index+1}. {episode['title']}"
             download_dir = f'{os.path.dirname(path)}/{name}'
             os.makedirs(download_dir, exist_ok=True)
-            download_book(episode['uuid'],
-                          serial_path=f'{download_dir}/{name}')
+            download_book(episode['uuid'], serial_path=f'{download_dir}/{name}')
 
 
 def download_series(uuid):
@@ -277,11 +571,42 @@ def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument("command", choices=FUNCTION_MAP.keys())
     argparser.add_argument("uuid")
-    argparser.add_argument("--max_bitrate", action='store_false')
+    # ИСТОРИЧЕСКИЙ ФЛАГ: при наличии флага используем max_bitrate=False -> берём 'min_bit_rate'
+    argparser.add_argument("--max_bitrate", action='store_false', help="Use min_bit_rate if flag is present (legacy behavior).")
+    # Новые параметры управления сетевым поведением
+    argparser.add_argument("--proxy", type=str, default=None, help="Proxy URL, e.g. socks5h://127.0.0.1:9050 or http://127.0.0.1:8080")
+    argparser.add_argument("--throttle", type=float, default=None, help="Polite delay (seconds) between track downloads (e.g. 1.5)")
+    argparser.add_argument("--max-retries", type=int, default=None, help="Total retries for requests/downloads (default 5)")
+    argparser.add_argument("--backoff-initial", type=float, default=None, help="Initial backoff seconds (default 5)")
+    argparser.add_argument("--timeout-base-req", type=float, default=None, help="Base timeout for metadata requests (default 10)")
+    argparser.add_argument("--timeout-base-dl", type=float, default=None, help="Base timeout for file downloads (default 15)")
+    argparser.add_argument("--force-meta", action="store_true", help="Overwrite meta files (jpeg/json/info.txt) even if they exist")
     args = argparser.parse_args()
 
+    # Токен авторизации
     HEADERS['auth-token'] = get_auth_token()
 
+    # Прокси: из аргумента или переменной окружения BOOKMATE_PROXY
+    proxy_url = args.proxy or os.environ.get("BOOKMATE_PROXY")
+    if proxy_url:
+        CONFIG["proxy_url"] = proxy_url
+        print(f"Using proxy: {proxy_url}")
+
+    # Параметры сетевого поведения
+    if args.throttle is not None:
+        CONFIG["throttle"] = max(0.0, args.throttle)
+    if args.max_retries is not None:
+        CONFIG["max_retries"] = max(1, args.max_retries)
+    if args.backoff_initial is not None:
+        CONFIG["backoff_initial"] = max(0.1, args.backoff_initial)
+    if args.timeout_base_req is not None:
+        CONFIG["timeout_base_request"] = max(1.0, args.timeout_base_req)
+    if args.timeout_base_dl is not None:
+        CONFIG["timeout_base_download"] = max(1.0, args.timeout_base_dl)
+    if args.force_meta:
+        CONFIG["force_meta"] = True
+
+    # Вызов команды
     func = FUNCTION_MAP[args.command]
     if args.command == 'audiobook':
         func(args.uuid, max_bitrate=args.max_bitrate)
