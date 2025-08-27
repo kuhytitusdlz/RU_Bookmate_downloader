@@ -95,7 +95,7 @@ pip install -r .\requirements.txt
 # Авторизация
 python RUBookmatedownloader.py
 
-# Скачать аудио через прокси и объединить главы
+# Скачать аудио через прокси и не объединять главы
 $env:BOOKMATE_PROXY='socks5h://127.0.0.1:9050'
-python RUBookmatedownloader.py audiobook <id> --max-bitrate
+python RUBookmatedownloader.py audiobook --no-merge --max-bitrate <id>
 ```
