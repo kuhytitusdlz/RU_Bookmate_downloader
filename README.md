@@ -19,3 +19,20 @@
 `python RUBookmatedownloader.py serial <id>`
 5. Скачать серию текстовых книг, аудиокниг или комиксов:\
 `python RUBookmatedownloader.py series <id>`
+
+## run example
+```bash
+pip install virtualenv
+git clone ..
+cd .\RU_Bookmate_downloader\
+virtualenv venv
+venv\Scripts\activate
+pip install -r .\requirements.txt
+
+# авторизация
+python RUBookmatedownloader.py
+# скачать аудио
+set BOOKMATE_PROXY=socks5h://127.0.0.1:9050
+python RUBookmatedownloader.py audiobook --max_bitrate <id>
+
+```
