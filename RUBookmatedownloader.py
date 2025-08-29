@@ -123,18 +123,22 @@ def add_to_archive(uid: str):
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
-def get_auth_token():
+def get_auth_token(force: bool = False):
     token_file = "token.txt"
-    if os.path.isfile(token_file):
+    if not force and os.path.isfile(token_file):
         with open(token_file, encoding='utf-8') as file:
-            return file.read()
-    if HEADERS['auth-token']:
+            token = file.read().strip()
+            if token:
+                return token
+    if not force and HEADERS.get('auth-token'):
         return HEADERS['auth-token']
+
     auth_token = run_auth_webview()
+    if not auth_token:
+        raise RuntimeError("Не удалось получить OAuth токен Яндекса: окно авторизации закрыто или произошла ошибка.")
     with open(token_file, "w", encoding='utf-8') as file:
         file.write(auth_token)
     return auth_token
-
 
 def run_auth_webview():
     import webview
@@ -759,8 +763,8 @@ def download_series(uuid):
 
 def main():
     argparser = argparse.ArgumentParser()
-    argparser.add_argument("command", choices=FUNCTION_MAP.keys())
-    argparser.add_argument("uuid")
+    argparser.add_argument("command", choices=list(FUNCTION_MAP.keys()) + ["auth"])
+    argparser.add_argument("uuid", nargs="?")
     # ИСТОРИЧЕСКИЙ ФЛАГ: при наличии флага используем max_bitrate=False -> берём 'min_bit_rate'
     argparser.add_argument("--max-bitrate", action='store_false', help="Use min_bit_rate if flag is present (legacy behavior).")
     # Новые параметры управления сетевым поведением
@@ -807,6 +811,15 @@ def main():
     if args.force_meta:
         CONFIG["force_meta"] = True
 
+
+    # Обработка команды авторизации и валидация uuid
+    if args.command == "auth":
+        token = get_auth_token(force=True)
+        print("✅ Токен получен и сохранён в token.txt")
+        return
+    if args.command != "auth" and not args.uuid:
+        argparser.error("the following arguments are required for this command: uuid")
+
     # Вызов команды
     func = FUNCTION_MAP[args.command]
     if args.command == 'audiobook':
@@ -824,4 +837,9 @@ FUNCTION_MAP = {
 }
 
 if __name__ == "__main__":
+    # If run without arguments: open auth flow (backward-compatible behavior)
+    if len(sys.argv) == 1:
+        tok = get_auth_token(force=False)
+        print("✅ Токен получен и сохранён в token.txt" if tok else "❌ Не удалось получить токен")
+        sys.exit(0)
     main()
