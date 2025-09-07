@@ -423,8 +423,14 @@ def get_resource_info(resource_type, uuid, series=''):
     if not info:
         return None
 
-    picture_url = info[resource_type]["cover"]["large"]
-    name = info[resource_type]["title"]
+    meta = info.get(resource_type) or {}
+
+    # ---- Обложка (если есть) ----
+    cover = meta.get("cover") or {}
+    picture_url = cover.get("large") or meta.get("cover_url")
+
+    # ---- Название ----
+    name = meta.get("title") or "untitled"
     name = replace_forbidden_chars(name)
     namelist = name.split(". ", 2)[:2]
     name = "_".join(namelist)
@@ -434,11 +440,12 @@ def get_resource_info(resource_type, uuid, series=''):
     os.makedirs(download_dir, exist_ok=True)
 
     # --- JPEG (обложка) ---
-    jpeg_path = f'{path}.jpeg'
-    if os.path.isfile(jpeg_path) and not CONFIG["force_meta"]:
-        print(f"Cover already exists, skip: {jpeg_path}")
-    else:
-        asyncio.run(download_file(picture_url, jpeg_path))
+    if picture_url:
+        jpeg_path = f'{path}.jpeg'
+        if os.path.isfile(jpeg_path) and not CONFIG["force_meta"]:
+            print(f"Cover already exists, skip: {jpeg_path}")
+        else:
+            asyncio.run(download_file(picture_url, jpeg_path))
 
     # --- JSON с meta ---
     json_path = f"{path}.json"
@@ -449,79 +456,91 @@ def get_resource_info(resource_type, uuid, series=''):
             file.write(json.dumps(info, ensure_ascii=False))
         print(f"File downloaded successfully to {json_path}")
 
-    # --- Аннотация info.txt ---
-    book_info = info[resource_type]['annotation']
-    book_info += "\n\n"
+    # --- Аннотация info.txt (без KeyError) ---
+    parts = []
 
-    if info[resource_type]['age_restriction']:
-        if int(info[resource_type]['age_restriction']) > 0:
-            book_info += "\nВозрастные ограничения: "
-            book_info += info[resource_type]['age_restriction'] + "+"
+    annotation = meta.get('annotation') or ''
+    if annotation:
+        parts.append(annotation)
+        parts.append("")  # пустая строка
 
-    if info[resource_type]['owner_catalog_title']:
-        book_info += "\nПравообладатель: "
-        book_info += info[resource_type]['owner_catalog_title']
+    # возраст
+    age_restriction = meta.get('age_restriction')
+    try:
+        if age_restriction is not None and int(age_restriction) > 0:
+            parts.append(f"Возрастные ограничения: {int(age_restriction)}+")
+    except Exception:
+        pass
 
-    if info[resource_type]['publishers']:
-        i = 0
-        for publisher in info[resource_type]['publishers']:
-            if i > 0:
-                book_info += ", "
-            else:
-                book_info += "\nИздательство: "
-            book_info += publisher['name']
-            i += 1
+    owner = meta.get('owner_catalog_title')
+    if owner:
+        parts.append(f"Правообладатель: {owner}")
 
-    if info[resource_type]['publication_date']:
-        book_info += "\nГод выхода издания: "
-        import datetime as dt
-        epoch_time = int(info[resource_type]['publication_date'])
-        book_info += dt.datetime.fromtimestamp(epoch_time).strftime('%Y')
+    # издательства
+    publishers = meta.get('publishers') or []
+    if isinstance(publishers, list) and publishers:
+        pub_names = [p.get('name') for p in publishers if isinstance(p, dict) and p.get('name')]
+        if pub_names:
+            parts.append("Издательство: " + ", ".join(pub_names))
 
-    if info[resource_type]['duration']:
-        book_info += "\nДлительность: "
-        epoch_time = int(info[resource_type]['duration'])
-        seconds = epoch_time % 60
-        minutes = int(epoch_time / 60) % 60
-        hours = int(epoch_time / 3600)
-        if hours > 0:
-            book_info += str(hours) + " ч. "
-        book_info += str(minutes) + " мин. "
-        book_info += str(seconds) + " сек. "
+    # год
+    pubdate = meta.get('publication_date')
+    if pubdate:
+        try:
+            import datetime as dt
+            year = dt.datetime.fromtimestamp(int(pubdate)).strftime('%Y')
+            parts.append(f"Год выхода издания: {year}")
+        except Exception:
+            s = str(pubdate)
+            if len(s) >= 4 and s[:4].isdigit():
+                parts.append(f"Год выхода издания: {s[:4]}")
 
-    if info[resource_type]['translators']:
-        i = 0
-        for translator in info[resource_type]['translators']:
-            if i > 0:
-                book_info += ", "
-            else:
-                book_info += "\nПеревод: "
-            book_info += translator['name']
-            i += 1
+    # длительность (есть у аудиокниг, у книг — обычно нет)
+    duration = meta.get('duration')
+    if duration:
+        try:
+            epoch_time = int(duration)
+            seconds = epoch_time % 60
+            minutes = (epoch_time // 60) % 60
+            hours = epoch_time // 3600
+            dur_bits = []
+            if hours > 0:
+                dur_bits.append(f"{hours} ч.")
+            dur_bits.append(f"{minutes} мин.")
+            dur_bits.append(f"{seconds} сек.")
+            parts.append("Длительность: " + " ".join(dur_bits))
+        except Exception:
+            pass
 
-    if info[resource_type]['narrators']:
-        i = 0
-        for narrator in info[resource_type]['narrators']:
-            if i > 0:
-                book_info += ", "
-            else:
-                book_info += "\nОзвучили: "
-            book_info += narrator['name']
-            i += 1
+    # переводчики
+    translators = meta.get('translators') or []
+    if isinstance(translators, list) and translators:
+        tr_names = [t.get('name') for t in translators if isinstance(t, dict) and t.get('name')]
+        if tr_names:
+            parts.append("Перевод: " + ", ".join(tr_names))
 
-    if info[resource_type]['topics']:
-        i = 0
-        for topic in info[resource_type]['topics']:
-            if topic['title'] != "Аудио":
-                if i > 0:
-                    book_info += ", "
-                else:
-                    book_info += "\n\nТеги: "
-                book_info += topic['title']
-            i += 1
+    # дикторы (для аудио)
+    narrators = meta.get('narrators') or []
+    if isinstance(narrators, list) and narrators:
+        nar_names = [n.get('name') for n in narrators if isinstance(n, dict) and n.get('name')]
+        if nar_names:
+            parts.append("Озвучили: " + ", ".join(nar_names))
 
-    # write_book_info сама пропустит запись, если info.txt уже есть (если не force_meta)
-    write_book_info(book_info, os.path.join(download_dir, "info"), overwrite=CONFIG["force_meta"])
+    # темы/теги
+    topics = meta.get('topics') or []
+    if isinstance(topics, list) and topics:
+        topic_titles = []
+        for t in topics:
+            if isinstance(t, dict):
+                title = t.get('title')
+                if title and title != "Аудио":
+                    topic_titles.append(title)
+        if topic_titles:
+            parts.append("")
+            parts.append("Теги: " + ", ".join(topic_titles))
+
+    info_txt = "\n".join(parts)
+    write_book_info(info_txt, os.path.join(download_dir, "info"), overwrite=CONFIG["force_meta"])
 
     return path
 
@@ -538,7 +557,15 @@ def download_book(uuid, series='', serial_path=None):
     path = serial_path if serial_path else get_resource_info('book', uuid, series)
     asyncio.run(download_file(
         URLS['book']['contentUrl'].format(uuid=uuid), f'{path}.epub'))
-    # epub_to_fb2(f"{path}.epub", f"{path}.fb2")
+    # Extra formats requested: FB2 + simple text-only PDF
+    try:
+        epub_to_fb2(f"{path}.epub", f"{path}.fb2")
+    except Exception as e:
+        print(f"WARNING: FB2 conversion failed: {e}")
+    try:
+        epub_to_plain_pdf(f"{path}.epub", f"{path}.pdf")
+    except Exception as e:
+        print(f"WARNING: PDF conversion failed: {e}")
 
     add_to_archive(uuid)
 
@@ -655,7 +682,8 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
                 print(" Cleaning up chapter files...")
                 for chapter_file in chapter_files:
                     try:
-                        Path(chapter_file).unlink()
+                        from pathlib import Path as _P
+                        _P(chapter_file).unlink()
                         print(f" Removed: {chapter_file.name}")
                     except OSError as e:
                         print(f" ⚠️ Could not remove {chapter_file.name}: {e}")
@@ -673,7 +701,8 @@ def merge_audiobook_chapters_ffmpeg(audiobook_dir, output_file, metadata=None, c
                 chapters_metadata_path.unlink()
         except Exception:
             pass
-def download_audiobook(uuid, series='', max_bitrate=False, merge_chapters=True, cleanup_chapters=True):
+
+def download_audiobook(uuid, series='', max_bitrate=False, merge_chapters=False, cleanup_chapters=True):
     if is_archived(uuid):
         print(f"[archive] Skipping already downloaded: {uuid}")
         return
@@ -707,6 +736,17 @@ def download_audiobook(uuid, series='', max_bitrate=False, merge_chapters=True, 
                     print(f"Throttling for {pause:.2f}s before next track...")
                     time.sleep(pause)
                 asyncio.run(download_file(download_url, f"{book_dir}/{name}"))
+        # Merge chapters if requested
+        if merge_chapters:
+            try:
+                output_file = f"{path}.m4a"
+                _meta = {"title": os.path.basename(path)}
+                ok = merge_audiobook_chapters_ffmpeg(book_dir, output_file, metadata=_meta, cleanup_chapters=cleanup_chapters)
+                if not ok:
+                    print("⚠️ Merge failed or was skipped.")
+            except Exception as e:
+                print(f"⚠️ Merge error: {e}")
+
     else:
         print(f" Audiobook chapters saved separately in: {os.path.dirname(path)}")
 
@@ -761,13 +801,140 @@ def download_series(uuid):
 
     add_to_archive(uuid)
 
+# =========================
+# Helpers for URL parsing & conversions
+# =========================
+_YA_AUDIO_RE = re.compile(r"https?://(?:www\.)?books\.yandex\.ru/audiobooks/([A-Za-z0-9_-]+)", re.IGNORECASE)
+_YA_BOOK_RE  = re.compile(r"https?://(?:www\.)?books\.yandex\.ru/books/([A-Za-z0-9_-]+)", re.IGNORECASE)
+
+def extract_id_and_type_from_url(url: str) -> tuple[str | None, str | None]:
+    """Return (id, type) where type is 'audiobook' or 'book'; otherwise (None, None)."""
+    url = url.strip()
+    if not url or url.startswith("#") or url.startswith(";"):
+        return (None, None)
+    # strip query
+    url_wo_q = url.split("?", 1)[0]
+    m = _YA_AUDIO_RE.search(url_wo_q)
+    if m:
+        return (m.group(1), 'audiobook')
+    m = _YA_BOOK_RE.search(url_wo_q)
+    if m:
+        return (m.group(1), 'book')
+    return (None, None)
+
+
+def epub_to_plain_pdf(epub_path: str, pdf_path: str):
+    """Create a very simple text-only PDF from EPUB contents.
+    This is basic: formatting/images are not preserved.
+    """
+    from reportlab.pdfgen import canvas as _canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        book = epub.read_epub(epub_path)
+
+    # Collect plain text from HTML documents
+    paragraphs: list[str] = []
+    for item in book.get_items():
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            text = soup.get_text(separator="\n")
+            # Normalize newlines
+            parts = [p.strip() for p in text.splitlines()]
+            paragraphs.extend([p for p in parts if p])
+
+    # Build PDF
+    page_w, page_h = A4
+    left = 20 * mm
+    right = 20 * mm
+    top = 20 * mm
+    bottom = 20 * mm
+    max_width = page_w - left - right
+
+    c = _canvas.Canvas(pdf_path, pagesize=A4)
+    text_obj = c.beginText(left, page_h - top)
+    # Use default font, wrap manually
+    from textwrap import wrap
+    # rough characters-per-line estimation
+    cpl = int(max_width / 6.0)  # ~6pt per char at default font
+
+    for para in paragraphs:
+        lines = wrap(para, cpl) or [""]
+        for line in lines:
+            text_obj.textLine(line)
+            if text_obj.getY() < bottom:
+                c.drawText(text_obj)
+                c.showPage()
+                text_obj = c.beginText(left, page_h - top)
+        # paragraph spacing
+        text_obj.textLine("")
+        if text_obj.getY() < bottom:
+            c.drawText(text_obj)
+            c.showPage()
+            text_obj = c.beginText(left, page_h - top)
+
+    c.drawText(text_obj)
+    c.save()
+    print(f"PDF saved to {pdf_path}")
+
+
+def process_batch_file(batch_path: str, merge_audio_default: bool = False, quality_default: str = 'max', cleanup_chapters_default: bool = True):
+    """
+    Process URLs from a text file (yt-dlp style). For each URL:
+    - If it's an audiobook => download with defaults: merge=merge_audio_default, quality=quality_default
+    - If it's a book => download EPUB and additionally produce FB2 and a plain-text PDF
+    - Duplicate URLs/IDs are handled by archive.txt automatically
+    """
+    if not os.path.exists(batch_path):
+        print(f"ERROR: Batch file not found: {batch_path}")
+        sys.exit(1)
+
+    print(f"Reading URLs from: {batch_path}")
+    with open(batch_path, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+
+    seen: set[str] = set()
+    processed = 0
+    for ln in lines:
+        uid, rtype = extract_id_and_type_from_url(ln)
+        if not uid or not rtype:
+            print(f"[skip] Unrecognized URL: {ln}")
+            continue
+        key = f"{rtype}:{uid}"
+        if key in seen:
+            print(f"[skip] duplicate in batch: {ln}")
+            continue
+        seen.add(key)
+
+        if rtype == "audiobook":
+            print(f"--> Audiobook {uid}: quality={quality_default}, merge_chapters={merge_audio_default}")
+            download_audiobook(uid,
+                               max_bitrate=(quality_default == 'max'),
+                               merge_chapters=merge_audio_default,
+                               cleanup_chapters=cleanup_chapters_default)
+        elif rtype == "book":
+            print(f"--> Book {uid}: downloading EPUB + FB2 + PDF")
+            download_book(uid)
+
+        processed += 1
+    print(f"Batch done. Processed entries: {processed}")
+
 def main():
     argparser = argparse.ArgumentParser()
-    argparser.add_argument("command", choices=list(FUNCTION_MAP.keys()) + ["auth"])
-    argparser.add_argument("uuid", nargs="?")
-    # ИСТОРИЧЕСКИЙ ФЛАГ: при наличии флага используем max_bitrate=False -> берём 'min_bit_rate'
-    argparser.add_argument("--max-bitrate", action='store_false', help="Use min_bit_rate if flag is present (legacy behavior).")
-    # Новые параметры управления сетевым поведением
+    argparser.add_argument("-a", "--batch-file", type=str, default=None,
+                           help="Read URLs from a text file (yt-dlp style). Each line is a URL from books.yandex.ru.")
+    # Single-run positional: could be a resource command ('book', 'audiobook', etc.), 'auth', a UUID, or a URL
+    argparser.add_argument("target", nargs="?",
+                           help="Resource type ('book', 'audiobook', 'comicbook', 'serial', 'series'), 'auth', a resource UUID, or a full URL.")
+    argparser.add_argument("uuid", nargs="?",
+                           help="Resource UUID (when target is a resource type). Ignored if target is a URL or 'auth'.")
+
+    # Clear and explicit quality control
+    argparser.add_argument("--quality", choices=["max", "min"], default="max",
+                           help="Audio quality for audiobooks (default: max)")
+    # Network behaviour
     argparser.add_argument("--proxy", type=str, default=None, help="Proxy URL, e.g. socks5h://127.0.0.1:9050 or http://127.0.0.1:8080")
     argparser.add_argument("--throttle", type=float, default=None, help="Polite delay (seconds) between track downloads (e.g. 1.5)")
     argparser.add_argument("--max-retries", type=int, default=None, help="Total retries for requests/downloads (default 5)")
@@ -776,28 +943,27 @@ def main():
     argparser.add_argument("--timeout-base-dl", type=float, default=None, help="Base timeout for file downloads (default 15)")
     argparser.add_argument("--force-meta", action="store_true", help="Overwrite meta files (jpeg/json/info.txt) even if they exist")
     argparser.add_argument("--archive", type=str, default="archive.txt", help="Path to archive file with downloaded IDs")
-    argparser.add_argument("--no-merge", action='store_true', help="Keep audiobook chapters as separate files (don't merge)")
+    argparser.add_argument("--no-merge", action='store_true', help="(Legacy, default is no-merge)")
     argparser.add_argument("--keep-chapters", action='store_true', help="Keep individual chapter files after merging")
+    argparser.add_argument("--merge-chapters", action='store_true', help="Merge audiobook chapters into a single file (default: do not merge)")
     args = argparser.parse_args()
+
+    # Merge behavior: default is DO NOT merge
+    merge_flag = True if getattr(args, 'merge_chapters', False) else False
 
     # Archive initialization
     init_archive(args.archive)
 
-    # Early archive check to avoid unnecessary auth/network if already downloaded
-    if is_archived(args.uuid):
-        print(f"[archive] Skipping already downloaded: {args.uuid}")
-        return
-
-    # Токен авторизации
+    # Authorization token
     HEADERS['auth-token'] = get_auth_token()
 
-    # Прокси: из аргумента или переменной окружения BOOKMATE_PROXY
+    # Proxy: arg or env
     proxy_url = args.proxy or os.environ.get("BOOKMATE_PROXY")
     if proxy_url:
         CONFIG["proxy_url"] = proxy_url
         print(f"Using proxy: {proxy_url}")
 
-    # Параметры сетевого поведения
+    # Networking tweaks
     if args.throttle is not None:
         CONFIG["throttle"] = max(0.0, args.throttle)
     if args.max_retries is not None:
@@ -811,21 +977,78 @@ def main():
     if args.force_meta:
         CONFIG["force_meta"] = True
 
-
-    # Обработка команды авторизации и валидация uuid
-    if args.command == "auth":
+    # Auth-only command
+    if args.target == "auth":
         token = get_auth_token(force=True)
         print("✅ Токен получен и сохранён в token.txt")
         return
-    if args.command != "auth" and not args.uuid:
-        argparser.error("the following arguments are required for this command: uuid")
 
-    # Вызов команды
-    func = FUNCTION_MAP[args.command]
-    if args.command == 'audiobook':
-        func(args.uuid, max_bitrate=args.max_bitrate, merge_chapters=not args.no_merge, cleanup_chapters=not args.keep_chapters)
-    else:
-        func(args.uuid)
+    # Batch mode
+    if args.batch_file:
+        process_batch_file(
+            args.batch_file,
+            merge_audio_default=merge_flag,
+            quality_default=args.quality,
+            cleanup_chapters_default=not args.keep_chapters,
+        )
+        return
+
+    # No batch: target can be URL, resource type + uuid, or just uuid
+    if not args.target:
+        # Backward-compatible behavior: open auth window if no args at all
+        token = get_auth_token(force=False)
+        print("✅ Токен получен и сохранён в token.txt" if token else "❌ Не удалось получить токен")
+        return
+
+    # URL mode (auto-detect resource type)
+    if isinstance(args.target, str) and args.target.startswith(("http://", "https://")):
+        uid, rtype = extract_id_and_type_from_url(args.target)
+        if not uid or not rtype:
+            print(f"❌ Unrecognized URL: {args.target}")
+            sys.exit(2)
+        if rtype == "audiobook":
+            download_audiobook(uid,
+                               max_bitrate=(args.quality == 'max'),
+                               merge_chapters=merge_flag,
+                               cleanup_chapters=not args.keep_chapters)
+        elif rtype == "book":
+            download_book(uid)
+        else:
+            print(f"❌ URL type '{rtype}' is not supported for direct URL mode.")
+            sys.exit(2)
+        return
+
+    # Resource type + UUID
+    if args.target in FUNCTION_MAP:
+        if not args.uuid:
+            argparser.error("the following arguments are required for this command: uuid")
+        func = FUNCTION_MAP[args.target]
+        if args.target == "audiobook":
+            func(args.uuid,
+                 max_bitrate=(args.quality == 'max'),
+                 merge_chapters=merge_flag,
+                 cleanup_chapters=not args.keep_chapters)
+        else:
+            func(args.uuid)
+        return
+
+    # If user passed only UUID (no explicit type) — try as book first, then audiobook
+    guess = args.target
+    if re.match(r"^[A-Za-z0-9_-]+$", guess):
+        try:
+            download_book(guess)
+            return
+        except SystemExit:
+            raise
+        except Exception:
+            download_audiobook(guess,
+                               max_bitrate=(args.quality == 'max'),
+                               merge_chapters=merge_flag,
+                               cleanup_chapters=not args.keep_chapters)
+            return
+
+    print(f"❌ Unknown target: {args.target}")
+    sys.exit(2)
 
 
 FUNCTION_MAP = {
