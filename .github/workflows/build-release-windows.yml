@@ -20,7 +20,7 @@ jobs:
   build_release_windows:
     runs-on: windows-latest
     env:
-      PYTHON_VERSION: '3.11'
+      PYTHON_VERSION: '3.13'
       FFMPEG_ZIP_URL: 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip'
       APP_ENTRY: 'RUBookmatedownloader.py'       # при необходимости поменяй входной скрипт
       APP_NAME: 'RUBookmateDownloader'           # имя exe
@@ -41,19 +41,23 @@ jobs:
           $wd = "$env:GITHUB_WORKSPACE"
           Write-Host "Cloning $repo into $wd ..."
           git config --global --add safe.directory $wd
-          git clone --no-checkout --depth 50 $uri $wd
+          git clone --no-checkout $uri $wd
           Set-Location $wd
           git checkout $env:GITHUB_SHA
+          git fetch --tags --force --prune
           git submodule update --init --recursive
           git status --short --branch
 
-      - name: Select Python
+      - name: Select Python 3.13 (fail if missing)
         id: py
         run: |
           $ErrorActionPreference = 'Stop'
-          try { $py = (py -$env:PYTHON_VERSION -c "import sys;print(sys.executable)") } catch { $py = "" }
-          if (-not $py) { try { $py = (py -c "import sys;print(sys.executable)") } catch { $py = "" } }
-          if (-not $py) { $py = (Get-Command python).Source }
+          try {
+            $py = (py -3.13 -c "import sys;print(sys.executable)")
+          } catch {
+            throw "Python 3.13 not available on this runner."
+          }
+          if (-not $py) { throw "Python 3.13 not available on this runner." }
           Write-Host "Using Python at: $py"
           echo "PYEXE=$py" >> $env:GITHUB_ENV
           & $py -V
@@ -66,7 +70,7 @@ jobs:
           }
           & "$env:PYEXE" -m pip install pyinstaller
 
-      - name: Download FFmpeg (keep this step)
+      - name: Download FFmpeg (prebuilt from BtbN, no build)
         run: |
           $zipUrl = $env:FFMPEG_ZIP_URL
           $out = "$env:RUNNER_TEMP\ffmpeg.zip"
