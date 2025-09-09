@@ -2,11 +2,15 @@ name: Build & Release (Windows, no external actions)
 
 on:
   push:
-    branches: [ main ]     # авто-релиз на каждый пуш в main
-  workflow_dispatch:       # и возможность запуска вручную
+    branches: [ main ]            # build & release on every push to main
+  workflow_dispatch:              # manual runs as well
 
 permissions:
-  contents: write          # нужно для пуша тэгов и создания релизов
+  contents: write                 # required for pushing tags & creating releases
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -15,91 +19,124 @@ defaults:
 jobs:
   build_release_windows:
     runs-on: windows-latest
+    env:
+      PYTHON_VERSION: '3.11'
+      FFMPEG_ZIP_URL: 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip'
+      APP_ENTRY: 'RUBookmatedownloader.py'       # при необходимости поменяй входной скрипт
+      APP_NAME: 'RUBookmateDownloader'           # имя exe
     steps:
-      - name: Clone repository (no checkout action)
-        env:
-          REPO: ${{ github.repository }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Show runner info
         run: |
-          $ErrorActionPreference = "Stop"
+          $PSVersionTable
           git --version
-          git config --global user.email "actions@github.com"
-          git config --global user.name "github-actions[bot]"
-          git clone "https://x-access-token:$env:GITHUB_TOKEN@github.com/$env:REPO" repo
-          git config --global --add safe.directory "$(Resolve-Path ./repo)"
-          Set-Location repo
-          git fetch --tags --force
+          python --version
+          py --list
 
-      - name: Auto bump tag (patch)
-        id: bump
+      - name: Manual checkout (no actions/checkout)
         run: |
-          $prefix = 'v'
-          $initial = 'v0.0.1'
-          $tags = (git tag --list 'v*')
-          if (-not $tags) {
-            $newTag = $initial
-          } else {
-            # находим максимальный по семверу
-            $latest = $tags | Sort-Object -Descending {[version]($_ -replace '^v','0.')} | Select-Object -First 1
-            $ver = [version]($latest -replace '^v','')
-            $newTag = "v{0}.{1}.{2}" -f $ver.Major, $ver.Minor, ($ver.Build + 1)
+          $ErrorActionPreference = 'Stop'
+          $repo = "${{ github.repository }}"
+          $token = "${{ secrets.GITHUB_TOKEN }}"
+          $uri = "https://x-access-token:$token@github.com/$repo.git"
+          $wd = "$env:GITHUB_WORKSPACE"
+          Write-Host "Cloning $repo into $wd ..."
+          git config --global --add safe.directory $wd
+          git clone --no-checkout --depth 50 $uri $wd
+          Set-Location $wd
+          git checkout $env:GITHUB_SHA
+          git submodule update --init --recursive
+          git status --short --branch
+
+      - name: Select Python
+        id: py
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try { $py = (py -$env:PYTHON_VERSION -c "import sys;print(sys.executable)") } catch { $py = "" }
+          if (-not $py) { try { $py = (py -c "import sys;print(sys.executable)") } catch { $py = "" } }
+          if (-not $py) { $py = (Get-Command python).Source }
+          Write-Host "Using Python at: $py"
+          echo "PYEXE=$py" >> $env:GITHUB_ENV
+          & $py -V
+
+      - name: Upgrade pip and install build deps
+        run: |
+          & "$env:PYEXE" -m pip install --upgrade pip wheel
+          if (Test-Path "requirements.txt") {
+            & "$env:PYEXE" -m pip install -r requirements.txt
           }
+          & "$env:PYEXE" -m pip install pyinstaller
+
+      - name: Download FFmpeg (keep this step)
+        run: |
+          $zipUrl = $env:FFMPEG_ZIP_URL
+          $out = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Write-Host "Downloading FFmpeg from $zipUrl ..."
+          Invoke-WebRequest -Uri $zipUrl -OutFile $out -UseBasicParsing
+          $dest = "$env:RUNNER_TEMP\ffmpeg"
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -Path $out -DestinationPath $dest
+          $bin = Get-ChildItem -Path $dest -Recurse -Filter ffmpeg.exe | Select-Object -First 1 | Split-Path
+          if (-not $bin) { throw "FFmpeg bin not found after extraction" }
+          Write-Host "FFmpeg bin: $bin"
+          "$bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build Windows executable (PyInstaller)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $entry = $env:APP_ENTRY
+          if (-not (Test-Path $entry)) { throw "Entry file not found: $entry" }
+          & "$env:PYEXE" -m PyInstaller `
+            --noconfirm `
+            --onefile `
+            --name "$($env:APP_NAME)" `
+            "$entry"
+          Get-ChildItem -Recurse -Force dist,build | Format-List -Property FullName,Length
+
+      - name: Prepare bundle (include FFmpeg)
+        run: |
+          $bundleRoot = Join-Path $env:GITHUB_WORKSPACE "release"
+          $bundleDir = Join-Path $bundleRoot "$($env:APP_NAME)-win64"
+          if (Test-Path $bundleDir) { Remove-Item $bundleDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+
+          Copy-Item "dist\${env:APP_NAME}.exe" $bundleDir -Force
+          if (Test-Path "README.md") { Copy-Item "README.md" $bundleDir -Force }
+          if (Test-Path "LICENSE")  { Copy-Item "LICENSE"  $bundleDir -Force }
+
+          # copy ffmpeg binaries (exe + dlls)
+          $ffbin = (Get-Command ffmpeg.exe).Source | Split-Path
+          Copy-Item "$ffbin\*" $bundleDir -Recurse -Force
+
+          # make ZIP
+          New-Item -ItemType Directory -Force -Path $bundleRoot | Out-Null
+          $zipPath = Join-Path $bundleRoot "$($env:APP_NAME)-win64.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath
+          Write-Host "ZIP ready: $zipPath"
+          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
+
+      - name: Compute & push next SemVer tag
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+
+          $latest = (git tag --list "v*" | Sort-Object {
+              try { [version]($_ -replace '^[vV]','') } catch { [version]'0.0.0' }
+            } -Descending | Select-Object -First 1)
+
+          if (-not $latest) { $latest = "v0.0.0" }
+          $ver = [version]($latest -replace '^[vV]','')
+          $newTag = "v{0}.{1}.{2}" -f $ver.Major, $ver.Minor, ($ver.Build + 1)
           echo "NEW_TAG=$newTag" >> $env:GITHUB_ENV
 
           git tag -a $newTag -m "chore: release $newTag"
           git push origin $newTag
           Write-Host "Bumped and pushed tag $newTag"
 
-      - name: Ensure Python
-        run: |
-          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-            choco install python -y
-            refreshenv
-          }
-          python --version
-          python -m pip install --upgrade pip
-          if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt }
-          python -m pip install pyinstaller
-
-      - name: Build EXE with PyInstaller
-        run: |
-          # поменяйте имя входного скрипта при необходимости
-          pyinstaller --noconfirm --onefile --name RUBookmatedownloader RUBookmatedownloader.py
-          if (!(Test-Path "dist/RUBookmatedownloader.exe")) {
-            throw "EXE not found at dist/RUBookmatedownloader.exe"
-          }
-
-      - name: Download FFmpeg (BtbN)
-        run: |
-          $ffUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip"
-          Invoke-WebRequest -Uri $ffUrl -OutFile ffmpeg.zip
-          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg -Force
-
-      - name: Prepare ZIP bundle
-        run: |
-          $bundleRoot = "bundle"
-          $bundleName = "RUBookmateDownloader-win64-$env:NEW_TAG"
-          $bundleDir  = Join-Path $bundleRoot $bundleName
-          New-Item -ItemType Directory -Force -Path "$bundleDir" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$bundleDir\ffmpeg\bin" | Out-Null
-
-          Copy-Item "dist\RUBookmatedownloader.exe" "$bundleDir\RUBookmatedownloader.exe"
-          # копируем ключевые бинарники ffmpeg
-          $ffBin = Get-ChildItem -Recurse ".\ffmpeg" | Where-Object { $_.Name -in @("ffmpeg.exe","ffplay.exe","ffprobe.exe") }
-          foreach ($f in $ffBin) { Copy-Item $f.FullName "$bundleDir\ffmpeg\bin\" -Force }
-
-          if (Test-Path "README.md") { Copy-Item "README.md" "$bundleDir\" }
-
-          New-Item -ItemType Directory -Force -Path $bundleRoot | Out-Null
-          $zipPath = "$bundleRoot\$bundleName.zip"
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath
-          Write-Host "ZIP ready: $zipPath"
-          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
-
-      - name: Create GitHub Release & Upload asset (gh CLI)
+      - name: Create GitHub Release & upload asset (gh CLI)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh возьмёт токен из переменной
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh --version
           gh release create "$env:NEW_TAG" "$env:ZIP_PATH" --title "Release $env:NEW_TAG" --generate-notes
