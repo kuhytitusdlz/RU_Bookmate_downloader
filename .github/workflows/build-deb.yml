@@ -15,100 +15,63 @@ permissions:
 jobs:
   build-debian:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          fetch-depth: 0
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+      - name: Derive version from ref
+        id: ver
+        run: |
+          REF="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="${REF#v}"
+          else
+            VER="0.0.0+${GITHUB_RUN_NUMBER}"
+          fi
+          echo "VER=$VER" >> $GITHUB_ENV
+          echo "version=$VER" >> $GITHUB_OUTPUT
 
-      - name: Install build deps
+      - name: Install packaging toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fakeroot dpkg-dev
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            echo "requirements.txt not found, installing known deps"
-            pip install httpx beautifulsoup4 ebooklib reportlab pillow pywebview lxml
-          fi
-          pip install pyinstaller
+          sudo apt-get install -y devscripts debhelper dpkg-dev fakeroot
 
-      - name: Build binary (PyInstaller)
+      - name: Build with debian/*
+        if: ${{ hashFiles('debian/control') != '' }}
+        env:
+          VER: ${{ env.VER }}
         run: |
-          pyinstaller RUBookmatedownloader.py             --name RUBookmateDownloader             --onefile             --collect-all ebooklib             --collect-all bs4             --collect-all reportlab             --collect-all PIL
-          ls -lah dist || true
+          export DEBFULLNAME="CI"
+          export DEBEMAIL="ci@example.invalid"
+          dch -v "${VER}-1" -b "Automated build for ${GITHUB_SHA::7}"
+          dch -r ""
+          dpkg-buildpackage -us -uc -b
 
-      - name: Compute version and metadata
-        id: meta
+      - name: Build (fallback via fpm)
+        if: ${{ hashFiles('debian/control') == '' }}
+        env:
+          VER: ${{ env.VER }}
         run: |
-          REF="${GITHUB_REF##*/}"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            VERSION="$REF"
-          else
-            VERSION="0.0.0+${GITHUB_RUN_NUMBER}"
-          fi
-          ARCH="amd64"
-          PKG="rubookmate-downloader"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "pkg=$PKG" >> $GITHUB_OUTPUT
+          sudo apt-get install -y ruby ruby-dev rubygems
+          sudo gem install --no-document fpm
+          mkdir -p pkg/usr/local/bin
+          cp RUBookmatedownloader.py pkg/usr/local/bin/RUBookmatedownloader
+          fpm -s dir -t deb \
+            -n rubookmatedownloader \
+            -v "${VER}" \
+            --description "RUBookmatedownloader" \
+            --license "MIT" \
+            --prefix / \
+            -C pkg \
+            usr/local/bin/RUBookmatedownloader
 
-      - name: Create .deb layout
-        run: |
-          set -eux
-          PKG="${{ steps.meta.outputs.pkg }}"
-          VERSION="${{ steps.meta.outputs.version }}"
-          ARCH="${{ steps.meta.outputs.arch }}"
-          ROOT="debbuild/${PKG}_${VERSION}_${ARCH}"
-          mkdir -p "$ROOT/DEBIAN"
-          mkdir -p "$ROOT/usr/local/bin"
-          mkdir -p "$ROOT/usr/share/doc/$PKG"
-          # control file
-          cat > "$ROOT/DEBIAN/control" <<EOF
-          Package: $PKG
-          Version: ${VERSION#v}
-          Section: utils
-          Priority: optional
-          Architecture: $ARCH
-          Depends: ffmpeg
-          Maintainer: ${GITHUB_REPOSITORY_OWNER}
-          Description: RU Bookmate downloader CLI with audiobook merge
-           Downloads Bookmate books/audiobooks and can merge audiobook chapters into one file.
-          EOF
-          # license/readme
-          if [ -f LICENSE ]; then cp LICENSE "$ROOT/usr/share/doc/$PKG/"; fi
-          if [ -f README.md ]; then cp README.md "$ROOT/usr/share/doc/$PKG/"; fi
-          # binary
-          install -m 0755 dist/RUBookmateDownloader "$ROOT/usr/local/bin/rubookmate-downloader"
-          # build deb
-          fakeroot dpkg-deb --build "$ROOT"
-          mkdir -p release
-          mv "debbuild/${PKG}_${VERSION}_${ARCH}.deb" "release/${PKG}_${VERSION}_${ARCH}.deb"
-          ls -lah release
-
-      - name: Upload artifact
+      - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rubookmate-downloader-deb
-          path: release/*.deb
-
-      - name: Publish GitHub Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/*.deb
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: rubookmatedownloader-${{ env.VER }}-deb
+          path: |
+            *.deb
+            ../*.deb

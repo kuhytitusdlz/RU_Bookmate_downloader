@@ -17,6 +17,22 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from PIL import Image
 
+# ============
+# Graceful exit
+# ============
+class GracefulExit(SystemExit):
+    """Управляемый выход без трейсбеков (например, по Ctrl+C)."""
+    pass
+
+def run_async_safely(coro):
+    """Запускает корутину и гасит Ctrl+C без трейcбека."""
+    try:
+        return asyncio.run(coro)
+    except KeyboardInterrupt:
+        # Преобразуем в управляемый выход — ниже поймаем и завершимся красиво
+        raise GracefulExit(130)
+
+
 # =========================
 # Конфигурация по умолчанию
 # =========================
@@ -120,6 +136,7 @@ def add_to_archive(uid: str):
             f.write(uid + "\n")
         arc.add(uid)
         print(f"[archive] Added {uid} to {ARCHIVE_FILE}")
+
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -237,6 +254,7 @@ async def download_file(
                 tmp_path = f"{file_path}.part"
                 async with client.stream("GET", url, headers=HEADERS) as resp:
                     if resp.status_code != 200:
+                        await _print_error_body(resp)
                         raise httpx.HTTPStatusError(
                             f"Bad status {resp.status_code}",
                             request=resp.request,
@@ -249,6 +267,11 @@ async def download_file(
                 os.replace(tmp_path, file_path)
                 print(f"File downloaded successfully to {file_path}")
                 return
+
+        except asyncio.CancelledError:
+            # Отмена ожидания/операции — тихо завершаемся
+            print("\nОтмена по запросу пользователя. Выходим…")
+            raise GracefulExit(130)
 
         except (httpx.ReadError,
                 httpx.TimeoutException,
@@ -271,7 +294,7 @@ async def download_file(
                 if status in RETRY_STATUSES:
                     retry_after = _parse_retry_after(e.response.headers.get("Retry-After"))
 
-            if attempt < max_retries - 1 and (status in (None, RETRY_STATUSES)):
+            if attempt < max_retries - 1 and (status is None or status in RETRY_STATUSES):
                 base_wait = backoff_initial * factor
                 wait_s = max(base_wait, retry_after or 0.0)
                 wait_s = min(wait_s, backoff_cap) + random.uniform(0, 0.8)
@@ -280,10 +303,55 @@ async def download_file(
                     f"Download attempt {attempt+1}/{max_retries} failed ({human}). "
                     f"Retrying in {wait_s:.1f}s..."
                 )
-                await asyncio.sleep(wait_s)
+                try:
+                    await asyncio.sleep(wait_s)
+                except asyncio.CancelledError:
+                    print("\nОтмена по запросу пользователя. Выходим…")
+                    raise GracefulExit(130)
             else:
                 print("Failed to download the file after several attempts.")
                 sys.exit(1)
+
+
+async def download_file_once(url: str, file_path: str, base_timeout: float | None = None):
+    """
+    ОДНА попытка скачивания без внутреннего бэкоффа/ретраев.
+    Если не 200 — печатает тело ответа и поднимает HTTPStatusError.
+    Нужна для логики fallback качества.
+    """
+    if base_timeout is None:
+        base_timeout = CONFIG["timeout_base_download"]
+
+    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+
+    timeout = httpx.Timeout(
+        connect=base_timeout,
+        read=base_timeout,
+        write=base_timeout,
+        pool=base_timeout,
+    )
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=timeout,
+        transport=_build_transport(http2=True, verify=False),
+    ) as client:
+        tmp_path = f"{file_path}.part"
+        async with client.stream("GET", url, headers=HEADERS) as resp:
+            if resp.status_code != 200:
+                # напечатаем тело и бросим исключение — чтобы снаружи понять статус и принять решение
+                await _print_error_body(resp)
+                raise httpx.HTTPStatusError(
+                    f"Bad status {resp.status_code}",
+                    request=resp.request,
+                    response=resp,
+                )
+            with open(tmp_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(65536):
+                    if chunk:
+                        f.write(chunk)
+        os.replace(tmp_path, file_path)
+        print(f"File downloaded successfully to {file_path}")
 
 
 async def send_request(
@@ -324,12 +392,18 @@ async def send_request(
                     return resp
                 # ретраи только на RETRY_STATUSES
                 if resp.status_code in RETRY_STATUSES:
+                    await _print_error_body(resp)
                     raise httpx.HTTPStatusError(
                         f"Bad status {resp.status_code}",
                         request=resp.request,
                         response=resp,
                     )
+                await _print_error_body(resp)
                 resp.raise_for_status()
+
+        except asyncio.CancelledError:
+            print("\nОтмена по запросу пользователя. Выходим…")
+            raise GracefulExit(130)
 
         except (httpx.ReadError,
                 httpx.TimeoutException,
@@ -349,12 +423,13 @@ async def send_request(
                 base_wait = backoff_initial * factor
                 wait_s = max(base_wait, retry_after or 0.0)
                 wait_s = min(wait_s, backoff_cap) + random.uniform(0, 0.8)
-                human = f"HTTPStatusError: Bad status {status}" if status else f"{type(e).__name__}"
-                print(
-                    f"Request attempt {attempt+1}/{max_retries} failed ({human}). "
-                    f"Retrying in {wait_s:.1f}s..."
-                )
-                await asyncio.sleep(wait_s)
+                human = f"Request attempt {attempt+1}/{max_retries} failed (HTTP {status})."
+                print(f"{human} Retrying in {wait_s:.1f}s...")
+                try:
+                    await asyncio.sleep(wait_s)
+                except asyncio.CancelledError:
+                    print("\nОтмена по запросу пользователя. Выходим…")
+                    raise GracefulExit(130)
             else:
                 print("Failed to download the file after several attempts. Check the ID or try again later.")
                 sys.exit(1)
@@ -392,7 +467,7 @@ def epub_to_fb2(epub_path, fb2_path):
     fb2_content += '</body>\n</fb2>'
 
     with open(fb2_path, 'w', encoding='utf-8') as fb2_file:
-        fb2_file.write(fb2_content)
+        fb2.write(fb2_content)
 
     print(f"fb2 file save to {fb2_path}")
 
@@ -419,7 +494,7 @@ def get_resource_info(resource_type, uuid, series=''):
     кроме случая force_meta.
     """
     info_url = URLS[resource_type]['infoUrl'].format(uuid=uuid)
-    info = asyncio.run(send_request(info_url)).json()
+    info = run_async_safely(send_request(info_url)).json()
     if not info:
         return None
 
@@ -445,7 +520,7 @@ def get_resource_info(resource_type, uuid, series=''):
         if os.path.isfile(jpeg_path) and not CONFIG["force_meta"]:
             print(f"Cover already exists, skip: {jpeg_path}")
         else:
-            asyncio.run(download_file(picture_url, jpeg_path))
+            run_async_safely(download_file(picture_url, jpeg_path))
 
     # --- JSON с meta ---
     json_path = f"{path}.json"
@@ -547,7 +622,41 @@ def get_resource_info(resource_type, uuid, series=''):
 
 def get_resource_json(resource_type, uuid):
     url = URLS[resource_type]['contentUrl'].format(uuid=uuid)
-    return asyncio.run(send_request(url)).json()
+    return run_async_safely(send_request(url)).json()
+
+
+# ------- Вспомогательные функции для аудио (ДИНАМИКА из playlists.json)
+
+def _available_variants_track(track: dict) -> dict:
+    """dict {variant_key: url} для offline-вариантов КОНКРЕТНОГО трека."""
+    out = {}
+    off = (track or {}).get('offline') or {}
+    for k, v in off.items():
+        if isinstance(v, dict) and v.get('url'):
+            out[k] = v['url']
+    return out
+
+def _playlist_variants_order(resp_json: dict, pref: str) -> list[str]:
+    """
+    Возвращает СПИСОК вариантов в порядке из sorted(set(...)) по всем трекам.
+    Если pref='max' -> как есть; если 'min' -> реверс.
+    """
+    variants = set()
+    for t in resp_json.get('tracks', []):
+        off = t.get('offline') or {}
+        variants |= set(k for k in off.keys() if isinstance(off.get(k), dict) and off.get(k, {}).get('url'))
+    ordered = sorted(variants)
+    print("Available offline variants:", ", ".join(ordered) or "(none)")
+    if pref == 'min':
+        ordered = list(reversed(ordered))
+    # pref может быть только 'max' или 'min' (по CLI)
+    return ordered
+
+def _preferred_key(pref_order: list[str], fallback_to_first_if_empty=True) -> str | None:
+    """Берёт первый элемент из списка как предпочитаемый ключ."""
+    if pref_order:
+        return pref_order[0]
+    return pref_order[0] if (fallback_to_first_if_empty and pref_order) else None
 
 
 def download_book(uuid, series='', serial_path=None):
@@ -555,7 +664,7 @@ def download_book(uuid, series='', serial_path=None):
         print(f"[archive] Skipping already downloaded: {uuid}")
         return
     path = serial_path if serial_path else get_resource_info('book', uuid, series)
-    asyncio.run(download_file(
+    run_async_safely(download_file(
         URLS['book']['contentUrl'].format(uuid=uuid), f'{path}.epub'))
     # Extra formats requested: FB2 + simple text-only PDF
     try:
@@ -709,33 +818,76 @@ def download_audiobook(uuid, series='', max_bitrate=False, merge_chapters=False,
     path = get_resource_info('audiobook', uuid, series)
     resp = get_resource_json('audiobook', uuid)
     if resp:
-        bitrate = 'max_bit_rate' if max_bitrate else 'min_bit_rate'
+        # Сформируем базовый порядок ИСКЛЮЧИТЕЛЬНО из playlists.json
+        pref_mode = 'max' if max_bitrate else 'min'
+        base_order = _playlist_variants_order(resp, pref=pref_mode)  # печатает Available offline variants
         json_data = resp['tracks']
         book_dir = os.path.dirname(path)
         files = os.listdir(book_dir)
         ntracks = len(json_data)
-        if ntracks < 10:
-            width = 1
-        elif 10 <= ntracks < 100:
-            width = 2
-        else:
-            width = 3
+        width = 1 if ntracks < 10 else (2 if ntracks < 100 else 3)
+
+        # Предпочитаемый ключ (первый в base_order)
+        pref_key = _preferred_key(base_order)
 
         for track in json_data:
             ntrack = f'{track["number"]}'
-            i = len(ntrack)
-            while i < width:
+            while len(ntrack) < width:
                 ntrack = '0' + ntrack
-                i = i + 1
-            name = 'Глава_' + ntrack + '.m4a'
-            if name not in files:
-                download_url = track['offline'][bitrate]['url'].replace(".m3u8", ".m4a")
-                # «вежливая» задержка, если включена
-                if CONFIG["throttle"] and CONFIG["throttle"] > 0:
-                    pause = random.uniform(CONFIG["throttle"] / 2, CONFIG["throttle"])
-                    print(f"Throttling for {pause:.2f}s before next track...")
-                    time.sleep(pause)
-                asyncio.run(download_file(download_url, f"{book_dir}/{name}"))
+            name = f'Глава_{ntrack}.m4a'
+            out_path = f"{book_dir}/{name}"
+
+            if name in files:
+                continue
+
+            # «вежливая» задержка, если включена
+            if CONFIG["throttle"] and CONFIG["throttle"] > 0:
+                pause = random.uniform(CONFIG["throttle"] / 2, CONFIG["throttle"])
+                print(f"Throttling for {pause:.2f}s before next track...")
+                time.sleep(pause)
+
+            av = _available_variants_track(track)
+            # Try- ordem: фильтруем ДЛЯ ЭТОГО трека согласно base_order
+            try_order = [k for k in base_order if k in av]
+
+            if not try_order:
+                print(f"❌ No offline URL for track {ntrack}")
+                continue
+
+            success = False
+
+            for idx, key in enumerate(try_order):
+                url_try = av[key].replace(".m3u8", ".m4a")
+                try:
+                    # одна попытка без бэкоффа — если 5xx, пробуем следующий вариант качества
+                    run_async_safely(download_file_once(url_try, out_path))
+                    if idx > 0:
+                        # если это не первый (предпочтительный) — сообщаем о даунгрейде/смене
+                        print(f"Fallback to {key} for track {ntrack} (preferred {try_order[0]} was 5xx).")
+                    success = True
+                    break
+                except GracefulExit:
+                    raise
+                except httpx.HTTPStatusError as e:
+                    st = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+                    # если не 5xx — это реальная ошибка, пробрасываем немедленно
+                    if not (st and 500 <= st <= 599):
+                        raise
+                    # 5xx — печать body уже была внутри download_file_once; идём понижать качество
+                    continue
+
+            if not success:
+                # Все варианты дали 5xx: тело ответа уже показали внутри download_file_once.
+                print(f"All variants 5xx for track {ntrack}. Will retry preferred with backoff...")
+                # следующая попытка — по обычной схеме (с бэкоффом/ретраями)
+                # берём предпочитаемый из try_order; если вдруг пусто — пропускаем
+                retry_key = try_order[0] if try_order else None
+                if not retry_key:
+                    print(f"❌ No usable offline variants for track {ntrack}")
+                    continue
+                final_url = av[retry_key].replace(".m3u8", ".m4a")
+                run_async_safely(download_file(final_url, out_path))
+
         # Merge chapters if requested
         if merge_chapters:
             try:
@@ -763,7 +915,7 @@ def download_comicbook(uuid, series=''):
         namelist = path.split(". ", 2)[:2]
         name = "_".join(namelist)
         download_dir = os.path.dirname(path)
-        asyncio.run(download_file(download_url, f'{name}.cbr'))
+        run_async_safely(download_file(download_url, f'{name}.cbr'))
         with zipfile.ZipFile(f'{name}.cbr', 'r') as zip_ref:
             zip_ref.extractall(download_dir)
         shutil.rmtree(download_dir + "/preview", ignore_errors=False, onerror=None)
@@ -921,6 +1073,23 @@ def process_batch_file(batch_path: str, merge_audio_default: bool = False, quali
         processed += 1
     print(f"Batch done. Processed entries: {processed}")
 
+
+async def _print_error_body(resp, limit: int = 4000) -> None:
+    """Безопасно печатает фрагмент тела ответа (до limit символов)."""
+    try:
+        # В stream-контексте тело может быть не прочитано — дочитаем
+        body = await resp.aread()
+        if not body:
+            return
+        text = body.decode('utf-8', 'replace')
+        print("---- Response body (truncated) ----")
+        print(text[:limit])
+        print("---- end body ----")
+    except Exception:
+        # Не мешаем основной логике ретраев
+        pass
+
+
 def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument("-a", "--batch-file", type=str, default=None,
@@ -931,9 +1100,12 @@ def main():
     argparser.add_argument("uuid", nargs="?",
                            help="Resource UUID (when target is a resource type). Ignored if target is a URL or 'auth'.")
 
-    # Clear and explicit quality control
+    # Оставляем ровно два режима CLI: max и min.
+    # Порядок вариантов внутри берём из playlists.json:
+    #   max -> как напечатает "Available offline variants"
+    #   min -> реверс этого списка
     argparser.add_argument("--quality", choices=["max", "min"], default="max",
-                           help="Audio quality for audiobooks (default: max)")
+                           help="Audio quality preference (default: max). The exact variants are taken from playlists.json.")
     # Network behaviour
     argparser.add_argument("--proxy", type=str, default=None, help="Proxy URL, e.g. socks5h://127.0.0.1:9050 or http://127.0.0.1:8080")
     argparser.add_argument("--throttle", type=float, default=None, help="Polite delay (seconds) between track downloads (e.g. 1.5)")
@@ -943,9 +1115,9 @@ def main():
     argparser.add_argument("--timeout-base-dl", type=float, default=None, help="Base timeout for file downloads (default 15)")
     argparser.add_argument("--force-meta", action="store_true", help="Overwrite meta files (jpeg/json/info.txt) even if they exist")
     argparser.add_argument("--archive", type=str, default="archive.txt", help="Path to archive file with downloaded IDs")
-    argparser.add_argument("--no-merge", action='store_true', help="(Legacy, default is no-merge)")
-    argparser.add_argument("--keep-chapters", action='store_true', help="Keep individual chapter files after merging")
-    argparser.add_argument("--merge-chapters", action='store_true', help="Merge audiobook chapters into a single file (default: do not merge)")
+    argparser.add_argument("--no-merge", action="store_true", help="(Legacy, default is no-merge)")
+    argparser.add_argument("--keep-chapters", action="store_true", help="Keep individual chapter files after merging")
+    argparser.add_argument("--merge-chapters", action="store_true", help="Merge audiobook chapters into a single file (default: do not merge)")
     args = argparser.parse_args()
 
     # Merge behavior: default is DO NOT merge
@@ -1060,9 +1232,17 @@ FUNCTION_MAP = {
 }
 
 if __name__ == "__main__":
-    # If run without arguments: open auth flow (backward-compatible behavior)
-    if len(sys.argv) == 1:
-        tok = get_auth_token(force=False)
-        print("✅ Токен получен и сохранён в token.txt" if tok else "❌ Не удалось получить токен")
-        sys.exit(0)
-    main()
+    try:
+        # If run without arguments: open auth flow (backward-compatible behavior)
+        if len(sys.argv) == 1:
+            tok = get_auth_token(force=False)
+            print("✅ Токен получен и сохранён в token.txt" if tok else "❌ Не удалось получить токен")
+            sys.exit(0)
+        main()
+    except GracefulExit as e:
+        code = e.code if isinstance(e.code, int) else 130
+        print("Завершено.")
+        sys.exit(code)
+    except KeyboardInterrupt:
+        print("\nЗавершено по Ctrl+C.")
+        sys.exit(130)

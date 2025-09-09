@@ -20,30 +20,53 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Derive version from ref
+        shell: bash
+        id: ver
+        run: |
+          REF="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="${REF#v}"
+          else
+            VER="0.0.0+${GITHUB_RUN_NUMBER}"
+          fi
+          echo "VER=$VER" >> $GITHUB_ENV
+          echo "version=$VER" >> $GITHUB_OUTPUT
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.13'
 
-      - name: Install build deps
+      - name: Install deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build EXE with PyInstaller
+      # === ВОТ ЭТО ВЕРНУЛ ===
+      - name: Download FFmpeg (BtbN)
         shell: pwsh
         run: |
-          # Clean previous builds if any
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
-          if (Test-Path dist)  { Remove-Item -Recurse -Force dist }
+          $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -UseBasicParsing
+          Expand-Archive ffmpeg.zip -DestinationPath "$env:RUNNER_TEMP\ffmpeg" -Force
+          # Найти bin с ffmpeg.exe
+          $ffmpegExe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $ffmpegExe) { throw "ffmpeg.exe not found after extraction" }
+          $ffBin = Split-Path $ffmpegExe.FullName -Parent
+          # Добавить в PATH на раннере
+          Add-Content $env:GITHUB_PATH $ffBin
+          Write-Host "FFmpeg bin: $ffBin"
 
-          # Build one-file EXE
+      - name: Build binary (PyInstaller)
+        shell: pwsh
+        run: |
           pyinstaller `
             --noconfirm `
             --onefile `
             --name RUBookmateDownloader `
-            --add-data "requirements.txt;." `
             --hidden-import httpx `
             --hidden-import PIL `
             --hidden-import ebooklib `
@@ -51,59 +74,31 @@ jobs:
             --hidden-import lxml `
             RUBookmatedownloader.py
 
-          # Determine output dist subfolder dynamically (PyInstaller creates dist/<name> or dist with single EXE)
+          # Определить dist-папку
           $distDir = (Get-ChildItem dist -Directory | Select-Object -First 1).FullName
           if (-not $distDir) { $distDir = "dist" }
-          echo "DISTDIR=$distDir" >> $env:GITHUB_ENV
+          echo "DIST=$distDir" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Download FFmpeg (BtbN prebuilt)
+      - name: Bundle FFmpeg next to EXE
         shell: pwsh
         run: |
-          $ffUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip"
-          $tmp    = "$env:RUNNER_TEMP"
-          $zip    = Join-Path $tmp "ffmpeg.zip"
-          $outDir = Join-Path $tmp "ffmpeg"
-          Invoke-WebRequest -Uri $ffUrl -OutFile $zip -UseBasicParsing
-          if (Test-Path $outDir) { Remove-Item -Recurse -Force $outDir }
-          Expand-Archive -Path $zip -DestinationPath $outDir -Force
+          $distDir = "$env:DIST"
+          $ffmpegExe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          $ffplayExe  = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Filter ffplay.exe  | Select-Object -First 1
+          if ($ffmpegExe) { Copy-Item $ffmpegExe.FullName -Destination $distDir -Force }
+          if ($ffprobeExe){ Copy-Item $ffprobeExe.FullName -Destination $distDir -Force }
+          if ($ffplayExe) { Copy-Item $ffplayExe.FullName  -Destination $distDir -Force }
 
-          # Find /bin with ffmpeg.exe
-          $binDir = Get-ChildItem $outDir -Recurse -Directory | Where-Object { Test-Path (Join-Path $_.FullName "ffmpeg.exe") } | Select-Object -First 1
-          if (-not $binDir) { Write-Error "ffmpeg.exe not found after extraction"; exit 1 }
-
-          $distDir = $env:DISTDIR
-          if (-not (Test-Path $distDir)) { New-Item -ItemType Directory -Force -Path $distDir | Out-Null }
-
-          Copy-Item (Join-Path $binDir.FullName "*") -Destination $distDir -Recurse -Force
-          Get-ChildItem $distDir -Filter "ff*.exe" | ForEach-Object { Write-Host "Bundled $($_.Name)" }
-
-      - name: Prepare release folder
+      - name: Create release zip
         shell: pwsh
         run: |
-          $distDir = $env:DISTDIR
-          $releaseDir = "release\RUBookmateDownloader-win64"
-          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-
-          # Copy main EXE and bundled tools
-          Copy-Item (Join-Path $distDir "RUBookmateDownloader.exe") $releaseDir -Force
-          if (Test-Path (Join-Path $distDir "ffmpeg.exe"))  { Copy-Item (Join-Path $distDir "ffmpeg.exe")  $releaseDir -Force }
-          if (Test-Path (Join-Path $distDir "ffprobe.exe")) { Copy-Item (Join-Path $distDir "ffprobe.exe") $releaseDir -Force }
-          if (Test-Path (Join-Path $distDir "ffplay.exe"))  { Copy-Item (Join-Path $distDir "ffplay.exe")  $releaseDir -Force }
-
-          # Optional: include README and license if present
-          if (Test-Path README.md) { Copy-Item README.md $releaseDir -Force }
-          if (Test-Path LICENSE)   { Copy-Item LICENSE   $releaseDir -Force }
-
-          # Also drop a version file
-          # (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") | Out-File -Encoding utf8 (Join-Path $releaseDir "build_info.txt")
-
-      - name: Zip release
-        shell: pwsh
-        run: |
-          $zipPath = "release\RUBookmateDownloader-win64.zip"
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          $zipPath = "release/RUBookmateDownloader-win64.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path "release\RUBookmateDownloader-win64\*" -DestinationPath $zipPath -Force
-          echo "ZIP=$zipPath" >> $env:GITHUB_ENV
+          Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($env:DIST, $zipPath)
+          Write-Host "ZIP created: $zipPath"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
