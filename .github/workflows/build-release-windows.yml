@@ -1,151 +1,106 @@
-name: Build & Release (Windows, auto-bump)
+name: Build & Release (Windows, no external actions)
 
 on:
   push:
-    branches: [ main ]         # авто-релиз после каждого коммита в main
-  workflow_dispatch:           # возможность запустить вручную
+    branches: [ main ]     # авто-релиз на каждый пуш в main
+  workflow_dispatch:       # и возможность запуска вручную
 
 permissions:
-  contents: write              # нужно для создания тэгов и релизов
-  actions: read
+  contents: write          # нужно для пуша тэгов и создания релизов
 
-concurrency:
-  group: windows-auto-release
-  cancel-in-progress: false
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
-  bump_tag:
-    name: Bump tag (patch)
-    runs-on: ubuntu-latest
-    outputs:
-      new_tag: ${{ steps.gettag.outputs.new_tag }}
-      new_tag_plain: ${{ steps.gettag.outputs.new_tag_plain }}
-    steps:
-      - name: Checkout (full history for tags)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Auto bump tag
-        id: bump
-        uses: anothrNick/github-tag-action@1.67.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Достаточно для ОДНОГО workflow
-          WITH_V: true
-          DEFAULT_BUMP: patch
-          INITIAL_VERSION: 0.0.1
-          RELEASE_BRANCHES: main
-          TAG_CONTEXT: repo
-
-      - name: Fetch tags to ensure local is up to date
-        run: |
-          git fetch --tags --force
-          git describe --tags --abbrev=0 || echo "v0.0.5"
-
-      - name: Determine new tag (robust)
-        id: gettag
-        shell: bash
-        run: |
-          # если action дал new_tag — используем его; иначе берём последний
-          TAG="${{ steps.bump.outputs.new_tag }}"
-          if [ -z "$TAG" ]; then
-            TAG="$(git describe --tags --abbrev=0)"
-          fi
-          echo "new_tag=$TAG" >> "$GITHUB_OUTPUT"
-          # без префикса v
-          echo "new_tag_plain=${TAG#v}" >> "$GITHUB_OUTPUT"
-        # debug:
-        # echo "New tag: $TAG"
-
-  build_windows:
-    name: Build Windows EXE
+  build_release_windows:
     runs-on: windows-latest
-    needs: bump_tag
-    env:
-      VERSION: ${{ needs.bump_tag.outputs.new_tag }}
-      VERSION_PLAIN: ${{ needs.bump_tag.outputs.new_tag_plain }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Install deps
-        shell: pwsh
+      - name: Clone repository (no checkout action)
+        env:
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if (Test-Path "requirements.txt") {
-            pip install -r requirements.txt
+          $ErrorActionPreference = "Stop"
+          git --version
+          git config --global user.email "actions@github.com"
+          git config --global user.name "github-actions[bot]"
+          git clone "https://x-access-token:$env:GITHUB_TOKEN@github.com/$env:REPO" repo
+          git config --global --add safe.directory "$(Resolve-Path ./repo)"
+          Set-Location repo
+          git fetch --tags --force
+
+      - name: Auto bump tag (patch)
+        id: bump
+        run: |
+          $prefix = 'v'
+          $initial = 'v0.0.1'
+          $tags = (git tag --list 'v*')
+          if (-not $tags) {
+            $newTag = $initial
+          } else {
+            # находим максимальный по семверу
+            $latest = $tags | Sort-Object -Descending {[version]($_ -replace '^v','0.')} | Select-Object -First 1
+            $ver = [version]($latest -replace '^v','')
+            $newTag = "v{0}.{1}.{2}" -f $ver.Major, $ver.Minor, ($ver.Build + 1)
           }
-          pip install pyinstaller
+          echo "NEW_TAG=$newTag" >> $env:GITHUB_ENV
+
+          git tag -a $newTag -m "chore: release $newTag"
+          git push origin $newTag
+          Write-Host "Bumped and pushed tag $newTag"
+
+      - name: Ensure Python
+        run: |
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            choco install python -y
+            refreshenv
+          }
+          python --version
+          python -m pip install --upgrade pip
+          if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt }
+          python -m pip install pyinstaller
 
       - name: Build EXE with PyInstaller
-        shell: pwsh
         run: |
-          # подставьте ваш основной скрипт, если имя иное
+          # поменяйте имя входного скрипта при необходимости
           pyinstaller --noconfirm --onefile --name RUBookmatedownloader RUBookmatedownloader.py
           if (!(Test-Path "dist/RUBookmatedownloader.exe")) {
-            Write-Error "EXE not found at dist/RUBookmatedownloader.exe"
+            throw "EXE not found at dist/RUBookmatedownloader.exe"
           }
 
       - name: Download FFmpeg (BtbN)
-        shell: pwsh
         run: |
           $ffUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip"
           Invoke-WebRequest -Uri $ffUrl -OutFile ffmpeg.zip
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg -Force
 
-      - name: Prepare bundle
-        shell: pwsh
+      - name: Prepare ZIP bundle
         run: |
           $bundleRoot = "bundle"
-          $bundleName = "RUBookmateDownloader-win64-${env:VERSION}"
+          $bundleName = "RUBookmateDownloader-win64-$env:NEW_TAG"
           $bundleDir  = Join-Path $bundleRoot $bundleName
-          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+          New-Item -ItemType Directory -Force -Path "$bundleDir" | Out-Null
           New-Item -ItemType Directory -Force -Path "$bundleDir\ffmpeg\bin" | Out-Null
 
           Copy-Item "dist\RUBookmatedownloader.exe" "$bundleDir\RUBookmatedownloader.exe"
-          # копируем только ключевые бинарники ffmpeg
+          # копируем ключевые бинарники ffmpeg
           $ffBin = Get-ChildItem -Recurse ".\ffmpeg" | Where-Object { $_.Name -in @("ffmpeg.exe","ffplay.exe","ffprobe.exe") }
           foreach ($f in $ffBin) { Copy-Item $f.FullName "$bundleDir\ffmpeg\bin\" -Force }
 
           if (Test-Path "README.md") { Copy-Item "README.md" "$bundleDir\" }
 
+          New-Item -ItemType Directory -Force -Path $bundleRoot | Out-Null
           $zipPath = "$bundleRoot\$bundleName.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath
           Write-Host "ZIP ready: $zipPath"
+          echo "ZIP_PATH=$zipPath" >> $env:GITHUB_ENV
 
-      - name: Upload artifact (for release)
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-zip
-          path: bundle/*.zip
-          if-no-files-found: error
-          retention-days: 7
-
-  release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    needs: [bump_tag, build_windows]
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-zip
-          path: ./release_assets
-
-      - name: Create Release & Upload Asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.bump_tag.outputs.new_tag }}
-          name: Release ${{ needs.bump_tag.outputs.new_tag }}
-          generate_release_notes: true
-          files: |
-            release_assets/*.zip
+      - name: Create GitHub Release & Upload asset (gh CLI)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh возьмёт токен из переменной
+        run: |
+          gh --version
+          gh release create "$env:NEW_TAG" "$env:ZIP_PATH" --title "Release $env:NEW_TAG" --generate-notes
+          Write-Host "Release $env:NEW_TAG created with asset $env:ZIP_PATH"
